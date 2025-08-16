@@ -43,10 +43,6 @@ app.post('/clone', upload.single('audio'), async (req, res) => {
       contentType: req.file.mimetype || 'audio/wav',
     });
 
-    // Debug: log form-data headers and fields
-    // console.log('FormData headers:', fd.getHeaders());
-    // console.log('FormData fields:', fd);
-
     const resp = await fetch('https://api.elevenlabs.io/v1/voices/add', {
       method: 'POST',
       headers: {
@@ -63,7 +59,6 @@ app.post('/clone', upload.single('audio'), async (req, res) => {
     }
 
     const data = await resp.json();
-    // Defensive: check for voice_id
     if (!data.voice_id) {
       console.error('No voice_id in ElevenLabs response:', data);
       return res.status(500).send('No voice_id returned from ElevenLabs');
@@ -111,4 +106,5 @@ app.post('/speak', async (req, res) => {
   }
 });
 
-app.listen(4000, () => console.log('API listening on :4000'));
+// For Vercel serverless: export the app as a handler
+export default app;
