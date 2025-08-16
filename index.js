@@ -106,5 +106,13 @@ app.post('/speak', async (req, res) => {
   }
 });
 
+// Print something to know that server is running (only if not in Vercel serverless)
+if (process.env.VERCEL !== "1") {
+  const PORT = process.env.PORT || 4000;
+  app.listen(PORT, () => {
+    console.log(`Voice Clone API server running on port ${PORT}`);
+  });
+}
+
 // For Vercel serverless: export the app as a handler
 export default app;
