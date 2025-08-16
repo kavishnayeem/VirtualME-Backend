@@ -78,11 +78,13 @@ app.post("/speak", async (req, res) => {
     const { voiceId, text } = req.body || {};
     if (!voiceId) return res.status(400).send("voiceId required");
 
+    // Use a cross-platform compatible output format: "pcm_44100" (WAV/PCM)
+    // This works on Android, iOS, and web (see ElevenLabs docs)
     const payload = {
       text: text || "This is a default sample of around one hundred words to demonstrate your cloned voice. You can replace this text in your app.",
       model_id: "eleven_multilingual_v2",
       voice_settings: { stability: 0.4, similarity_boost: 0.8 },
-      output_format: "mp3_44100_128",
+      output_format: "pcm_44100", // WAV/PCM, works everywhere
     };
 
     const tts = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
@@ -90,7 +92,7 @@ app.post("/speak", async (req, res) => {
       headers: {
         "xi-api-key": XI,
         "Content-Type": "application/json",
-        Accept: "audio/mpeg",
+        Accept: "audio/wav",
       },
       body: JSON.stringify(payload),
     });
@@ -100,7 +102,7 @@ app.post("/speak", async (req, res) => {
       return res.status(tts.status).send(t);
     }
 
-    res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader("Content-Type", "audio/wav");
     // In Node 18/20, tts.body is a web ReadableStream
     const buf = Buffer.from(await tts.arrayBuffer());
     res.end(buf);
