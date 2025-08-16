@@ -22,6 +22,14 @@ const upload = multer({
   },
 });
 
+app.get('/', (req, res) => {
+  res.type('text/plain').send(
+    'Voice API is up.\n\nEndpoints:\nPOST /clone (multipart form field: audio)\nPOST /speak (json: { voiceId, text })'
+  );
+});
+
+app.get('/healthz', (req, res) => res.send('ok'));
+
 app.post("/clone", (req, res) => {
   upload.single("audio")(req, res, async (err) => {
     try {
