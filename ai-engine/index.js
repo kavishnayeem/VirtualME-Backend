@@ -1,9 +1,10 @@
+// index.js
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
 
-// Node 18+ has global fetch/Blob/FormData via undici.
+// Node 18+ has global fetch/Blob/FormData (undici).
 // If you're on older Node, install undici or form-data & cross-blob.
 
 const app = express();
@@ -70,13 +71,57 @@ const upload = multer({
   },
 });
 
+/** ──────────────────────────────────────────────────────────────
+ * KV (Upstash/@vercel/kv) optional + in-memory fallback
+ * ────────────────────────────────────────────────────────────── */
+let kv = null;
+try {
+  // npm i @vercel/kv  (optional)
+  // Top-level await requires "type":"module" in package.json (you likely have it already).
+  const mod = await import('@vercel/kv').catch(() => null);
+  if (mod?.kv) kv = mod.kv;
+} catch { /* ignore */ }
+
+// Simple in-memory fallback (dev only; resets on redeploy)
+const mem = Object.create(null);
+
+async function storeSet(key, value) {
+  if (kv) { await kv.set(key, value); return; }
+  mem[key] = value;
+}
+async function storeGet(key) {
+  if (kv) return await kv.get(key);
+  return mem[key] ?? null;
+}
+
+/** ──────────────────────────────────────────────────────────────
+ * Reverse geocoding helper (optional, best-effort; cache if needed)
+ * ────────────────────────────────────────────────────────────── */
+async function reverseGeocode(lat, lon) {
+  try {
+    const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lon}`;
+    const resp = await fetch(url, { headers: { 'User-Agent': 'VirtualMe/1.0' } });
+    if (!resp.ok) return null;
+    const j = await resp.json();
+    return j?.display_name || null;
+  } catch {
+    return null;
+  }
+}
+
+/** ──────────────────────────────────────────────────────────────
+ * Root + health
+ * ────────────────────────────────────────────────────────────── */
 app.get('/', (_req, res) => {
   res
     .type('text/plain; charset=utf-8')
     .send(`Voice API up.
 
-POST /voice  (multipart form-data: audio=<file>, optional fields:
-  profileName, preferredName, voiceId, conversationId, hints)
+POST /voice  (multipart form-data: audio=<file>, optional: profileName, preferredName, voiceId, conversationId, hints)
+
+Location:
+POST /location/update   { payload: { latitude, longitude, timestamp, accuracy?, speed?, heading?, altitude? } }
+GET  /location/latest?userId=kavish
 
 Models:
   STT:  ${STT_MODEL}
@@ -84,27 +129,25 @@ Models:
 `);
 });
 
-app.get('/healthz', (_req, res) => res.type('application/json; charset=utf-8').send(JSON.stringify({ ok: true })));
+app.get('/healthz', (_req, res) =>
+  res.type('application/json; charset=utf-8').send(JSON.stringify({ ok: true }))
+);
 
 /** ──────────────────────────────────────────────────────────────
- * Helpers
+ * Language + persona helpers
  * ────────────────────────────────────────────────────────────── */
 function coalesceName(profileName, preferredName) {
-  // Defaults to "Kavish Nayeem" (preferred "Kavish")
   const full = (profileName || 'Kavish Nayeem').trim();
   const short = (preferredName || 'Kavish').trim();
   return { full, short };
 }
 
 function sanitizeVoiceId(voiceId) {
-  // ElevenLabs IDs are typically 20-30ish chars, alphanum with maybe dashes/underscores.
   if (!voiceId) return DEFAULT_VOICE_ID;
   if (!/^[A-Za-z0-9\-_]{6,64}$/.test(voiceId)) return DEFAULT_VOICE_ID;
   return voiceId;
 }
 
-// Map whisper BCP-47-ish codes to a readable label for the system prompt.
-// We keep it simple; if unknown, just pass the code.
 function languageLabel(code) {
   if (!code) return 'the same language as the user';
   const m = code.toLowerCase();
@@ -117,7 +160,6 @@ function languageLabel(code) {
   return map[m] || code;
 }
 
-/** Strict instruction to avoid mixed-language replies. */
 function buildSystemPrompt({ full, short }, languageName) {
   return [
     `You are the person "${full}" (preferred name: "${short}").`,
@@ -131,14 +173,65 @@ function buildSystemPrompt({ full, short }, languageName) {
 }
 
 /** ──────────────────────────────────────────────────────────────
- * Core endpoint: audio → STT → chat (persona, single-language) → TTS
- * Accepts multipart form-data with fields:
- *  - audio (file) [required]
- *  - profileName (string)        -> default "Kavish Nayeem"
- *  - preferredName (string)      -> default "Kavish"
- *  - voiceId (string)            -> default DEFAULT_VOICE_ID
- *  - conversationId (string)     -> to thread with prior messages
- *  - hints (string)              -> optional user-provided context
+ * LOCATION ENDPOINTS (no auth for now, per your request)
+ * Phone pushes latest location → Server stores → Any client fetches latest
+ * ────────────────────────────────────────────────────────────── */
+
+// Phone → Server: update latest location
+// Body: { payload: { latitude, longitude, timestamp, accuracy?, speed?, heading?, altitude? } }
+app.post('/location/update', async (req, res) => {
+  try {
+    const { payload } = req.body || {};
+    if (
+      !payload ||
+      typeof payload.latitude !== 'number' ||
+      typeof payload.longitude !== 'number' ||
+      typeof payload.timestamp !== 'number'
+    ) {
+      return res.status(400).json({ error: 'invalid payload' });
+    }
+
+    // For now, single-user "kavish". Later, derive from auth.
+    const key = `loc:kavish`;
+    const doc = { ...payload, updatedAt: Date.now() };
+    await storeSet(key, doc);
+    return res.json({ ok: true });
+  } catch (e) {
+    return res.status(500).json({ error: 'server', detail: String(e?.message || e) });
+  }
+});
+
+// Any client → Server: read latest location
+// Query: ?userId=kavish
+app.get('/location/latest', async (req, res) => {
+  try {
+    const userId = String(req.query.userId || 'kavish');
+    const key = `loc:${userId}`;
+    const data = await storeGet(key);
+    if (!data) return res.json({ found: false });
+
+    const ageMs = Date.now() - (data.updatedAt ?? data.timestamp ?? 0);
+    let place = null;
+    if (typeof data.latitude === 'number' && typeof data.longitude === 'number') {
+      place = await reverseGeocode(data.latitude, data.longitude).catch(() => null);
+    }
+
+    return res.json({
+      found: true,
+      latitude: data.latitude,
+      longitude: data.longitude,
+      accuracy: data.accuracy ?? null,
+      updatedAt: data.updatedAt ?? data.timestamp,
+      ageMs,
+      place // e.g., "Corpus Christi, Texas, United States"
+    });
+  } catch (e) {
+    return res.status(500).json({ error: 'server', detail: String(e?.message || e) });
+  }
+});
+
+/** ──────────────────────────────────────────────────────────────
+ * VOICE: audio → STT → chat → TTS
  * ────────────────────────────────────────────────────────────── */
 app.post('/voice', upload.single('audio'), async (req, res) => {
   try {
@@ -161,8 +254,7 @@ app.post('/voice', upload.single('audio'), async (req, res) => {
     const audioBlob = new Blob([req.file.buffer], { type: req.file.mimetype || 'audio/wav' });
     sttFd.append('file', audioBlob, req.file.originalname || 'audio.wav');
     sttFd.append('model', STT_MODEL);
-    sttFd.append('response_format', 'verbose_json'); // <-- includes "language"
-    // (No translation mode—respect original language.)
+    sttFd.append('response_format', 'verbose_json'); // includes "language"
 
     const sttResp = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
       method: 'POST',
@@ -181,21 +273,18 @@ app.post('/voice', upload.single('audio'), async (req, res) => {
     const langCode = (sttJson?.language || '').trim();
     const langName = languageLabel(langCode || '');
 
-    // 2) Build messages with history (if provided)
+    // 2) Messages with history
     const history = getHistory(conversationId);
     const systemMsg = buildSystemPrompt(persona, langName);
 
     const messages = [
       { role: 'system', content: systemMsg },
-      // Include prior turns (already role-tagged)
       ...history,
-      // Optional extra context the app wants to pass in (e.g., "about grandma's visit")
       ...(hints ? [{ role: 'system', content: `Context/hints from user: ${hints}` }] : []),
-      // Current user turn
       { role: 'user', content: transcript || 'Greet politely.' },
     ];
 
-    // 3) Chat (Groq) — lower temperature for crisper, consistent tone + single language
+    // 3) Chat (Groq)
     const chatResp = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -221,13 +310,13 @@ app.post('/voice', upload.single('audio'), async (req, res) => {
     const replyText = (chatJson?.choices?.[0]?.message?.content || '').trim()
       || (transcript ? `OK: ${transcript}` : `Hi, I'm ${persona.short}.`);
 
-    // 4) Save this turn to history (post-response)
+    // 4) Save history
     appendToHistory(conversationId, [
       { role: 'user', content: transcript || '' },
       { role: 'assistant', content: replyText },
     ]);
 
-    // 5) TTS (ElevenLabs proxy) — use provided voiceId (fallback pre-validated)
+    // 5) TTS proxy
     const ttsResp = await fetch(`${ELEVEN_URL}/speak`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json; charset=utf-8', Accept: 'audio/wav' },
