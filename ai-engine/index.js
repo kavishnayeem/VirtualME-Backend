@@ -190,6 +190,8 @@ app.post('/location/update', async (req, res) => {
     await storeSet(key, doc);
     // console log for quick debugging
     console.log('[location:update]', doc);
+    res.setHeader('X-Store', storeKind());
+res.setHeader('X-Saved-At', String(doc.updatedAt));
     return res.json({ ok: true });
   } catch (e) {
     return res.status(500).json({ error: 'server', detail: String(e?.message || e) });
@@ -211,7 +213,7 @@ app.get('/location/latest', async (req, res) => {
       place = geo?.display_name || null;
       address = geo?.address || null;
     }
-
+    res.setHeader('X-Store', storeKind());
     return res.json({
       found: true,
       latitude: data.latitude,
@@ -386,7 +388,27 @@ app.post('/voice', upload.single('audio'), async (req, res) => {
       .send(JSON.stringify({ error: 'Server error', detail: String(err?.message || err) }));
   }
 });
+// === Add below your storeSet/storeGet helpers ===
+function storeKind() {
+  return kv ? 'kv' : 'mem';
+}
 
+// === Add this tiny route to see which store is active ===
+app.get('/location/store-info', (_req, res) => {
+  res.json({ store: storeKind() });
+});
+
+// === Add this route to inject a test point quickly ===
+app.get('/location/mock', async (req, res) => {
+  const lat = parseFloat(req.query.lat);
+  const lon = parseFloat(req.query.lon);
+  const acc = req.query.acc ? Number(req.query.acc) : 15;
+  if (Number.isNaN(lat) || Number.isNaN(lon)) return res.status(400).json({ error: 'lat/lon required' });
+  const key = 'loc:kavish';
+  const doc = { latitude: lat, longitude: lon, accuracy: acc, timestamp: Date.now(), updatedAt: Date.now() };
+  await storeSet(key, doc);
+  res.json({ ok: true, store: storeKind(), saved: doc });
+});
 // Local dev: listen. Vercel: export default app.
 if (!isVercel) {
   const PORT = process.env.PORT || 3000;
