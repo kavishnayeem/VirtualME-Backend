@@ -62,25 +62,77 @@ const upload = multer({
 });
 
 /* ──────────────────────────────────────────────────────────────
- * KV (Upstash/@vercel/kv) optional + in-memory fallback
+ * Storage: Upstash Redis → Vercel KV → in-memory fallback
  * ────────────────────────────────────────────────────────────── */
-let kv = null;
-try {
-  const mod = await import('@vercel/kv').catch(() => null);
-  if (mod?.kv) kv = mod.kv;
-} catch {}
+let storeKindName = 'mem';
+let redis = null; // @upstash/redis
+let kv = null;    // @vercel/kv
+
+// Try Upstash first (recommended for latest-location use case)
+if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) {
+  try {
+    const up = await import('@upstash/redis').catch(() => null);
+    if (up?.Redis) {
+      redis = new up.Redis({
+        url: process.env.UPSTASH_REDIS_REST_URL,
+        token: process.env.UPSTASH_REDIS_REST_TOKEN
+      });
+      storeKindName = 'upstash';
+    }
+  } catch {}
+}
+
+// If Upstash not active, try Vercel KV
+if (storeKindName === 'mem' && process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN) {
+  try {
+    const mod = await import('@vercel/kv').catch(() => null);
+    if (mod?.kv) {
+      kv = mod.kv;
+      storeKindName = 'kv';
+    }
+  } catch {}
+}
+
+// In-memory fallback (dev only; resets on redeploy)
 const mem = Object.create(null);
+
+function storeKind() { return storeKindName; }
+function serialize(v) { try { return JSON.stringify(v); } catch { return String(v); } }
+function deserialize(v) { if (typeof v !== 'string') return v; try { return JSON.parse(v); } catch { return v; } }
+
 async function storeSet(key, value) {
-  if (kv) { await kv.set(key, value); return; }
+  if (storeKindName === 'upstash' && redis)  return void (await redis.set(key, serialize(value)));
+  if (storeKindName === 'kv' && kv)          return void (await kv.set(key, value));
   mem[key] = value;
 }
 async function storeGet(key) {
-  if (kv) return await kv.get(key);
+  if (storeKindName === 'upstash' && redis)  return deserialize(await redis.get(key));
+  if (storeKindName === 'kv' && kv)          return await kv.get(key);
   return mem[key] ?? null;
 }
 
+// Debug helpers
+app.get('/location/store-info', (_req, res) => {
+  res.json({
+    store: storeKind(),
+    hasUpstashEnv: !!(process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN),
+    hasVercelKVEnv: !!(process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN)
+  });
+});
+app.get('/location/mock', async (req, res) => {
+  const lat = parseFloat(req.query.lat);
+  const lon = parseFloat(req.query.lon);
+  const acc = req.query.acc ? Number(req.query.acc) : 15;
+  if (Number.isNaN(lat) || Number.isNaN(lon)) return res.status(400).json({ error: 'lat/lon required' });
+  const key = 'loc:kavish';
+  const doc = { latitude: lat, longitude: lon, accuracy: acc, timestamp: Date.now(), updatedAt: Date.now() };
+  await storeSet(key, doc);
+  res.setHeader('X-Store', storeKind());
+  res.json({ ok: true, saved: doc });
+});
+
 /* ──────────────────────────────────────────────────────────────
- * Reverse geocoding (returns display_name + address components)
+ * Reverse geocoding (street/city) + utils
  * ────────────────────────────────────────────────────────────── */
 async function reverseGeocode(lat, lon) {
   try {
@@ -98,7 +150,6 @@ async function reverseGeocode(lat, lon) {
 }
 function formatAddressLine(address) {
   if (!address) return null;
-  // Try to build a compact street → area → city → state string
   const parts = [
     address.road || address.pedestrian || address.path || address.cycleway || address.footway,
     address.neighbourhood || address.suburb || address.village || address.town || address.city_district,
@@ -129,7 +180,11 @@ POST /voice  (multipart form-data: audio=<file>, optional: profileName, preferre
 Location:
 POST /location/update   { payload: { latitude, longitude, timestamp, accuracy?, speed?, heading?, altitude? } }
 GET  /location/latest?userId=kavish
-GET  /location/debug?userId=kavish  -> human string for quick testing
+GET  /location/debug?userId=kavish
+
+Debug:
+GET  /location/store-info
+GET  /location/mock?lat=..&lon=..&acc=..
 
 Models:
   STT:  ${STT_MODEL}
@@ -141,7 +196,7 @@ app.get('/healthz', (_req, res) =>
 );
 
 /* ──────────────────────────────────────────────────────────────
- * Language + persona helpers
+ * Persona helpers
  * ────────────────────────────────────────────────────────────── */
 function coalesceName(profileName, preferredName) {
   const full = (profileName || 'Kavish Nayeem').trim();
@@ -168,16 +223,15 @@ function buildSystemPrompt({ full, short }, languageName) {
   return [
     `You are the person "${full}" (preferred name: "${short}").`,
     `Speak **in first person** as ${short}. Do not say you're an assistant, AI, or a bot.`,
-    `Keep replies natural, helpful, and concise (usually 1–3 sentences unless more detail is needed).`,
-    `Reply **only in ${languageName}**, matching the user's language. Do not translate, do not mix languages.`,
-    `If you are unsure, ask a brief clarifying question. If asked who you are, respond as ${short}.`,
-    `Avoid making commitments you can't keep (scheduling, promises).`,
-    `Context like calendar/location may be integrated later; don't invent details—be honest and brief.`,
+    `Keep replies natural, helpful, and concise.`,
+    `Reply **only in ${languageName}**, matching the user's language.`,
+    `If unsure, ask a brief clarifying question.`,
+    `Do not invent calendar/location; use only provided context.`,
   ].join(' ');
 }
 
 /* ──────────────────────────────────────────────────────────────
- * LOCATION ENDPOINTS (no auth for now)
+ * LOCATION ENDPOINTS
  * ────────────────────────────────────────────────────────────── */
 app.post('/location/update', async (req, res) => {
   try {
@@ -188,10 +242,9 @@ app.post('/location/update', async (req, res) => {
     const key = `loc:kavish`;
     const doc = { ...payload, updatedAt: Date.now() };
     await storeSet(key, doc);
-    // console log for quick debugging
     console.log('[location:update]', doc);
     res.setHeader('X-Store', storeKind());
-res.setHeader('X-Saved-At', String(doc.updatedAt));
+    res.setHeader('X-Saved-At', String(doc.updatedAt));
     return res.json({ ok: true });
   } catch (e) {
     return res.status(500).json({ error: 'server', detail: String(e?.message || e) });
@@ -229,7 +282,6 @@ app.get('/location/latest', async (req, res) => {
   }
 });
 
-/* Human-readable debug string: great for quick checks in the browser */
 app.get('/location/debug', async (req, res) => {
   try {
     const userId = String(req.query.userId || 'kavish');
@@ -249,35 +301,29 @@ app.get('/location/debug', async (req, res) => {
 });
 
 /* ──────────────────────────────────────────────────────────────
- * Helper to pull latest location as text for Groq context
+ * Helper for Groq context
  * ────────────────────────────────────────────────────────────── */
 async function latestLocationText(userId = 'kavish') {
   const key = `loc:${userId}`;
   const data = await storeGet(key);
   if (!data) return 'No recent location is available.';
-
   const ageMs = Date.now() - (data.updatedAt ?? data.timestamp ?? 0);
   const geo = await reverseGeocode(data.latitude, data.longitude).catch(() => null);
-  const streety = formatAddressLine(geo?.address) || geo?.display_name || `${data.latitude.toFixed(5)}, ${data.longitude.toFixed(5)}`;
-  return `Last seen near ${streety} (${timeAgo(ageMs)}). Accuracy ~${Math.round(data.accuracy ?? 0)}m.`;
+  const streety = formatAddressLine(geo?.address) || geo?.display_name ||
+    `${data.latitude.toFixed(5)}, ${data.longitude.toFixed(5)}`;
+  const acc = Number.isFinite(data.accuracy) ? ` Accuracy ~${Math.round(data.accuracy)}m.` : '';
+  return `Last seen near ${streety} (${timeAgo(ageMs)}).${acc}`;
 }
 
 /* ──────────────────────────────────────────────────────────────
- * VOICE: audio → STT → chat → TTS  (now with location context + debug headers)
+ * VOICE: audio → STT → chat → TTS  (adds location context + debug headers)
  * ────────────────────────────────────────────────────────────── */
 app.post('/voice', upload.single('audio'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).type('text/plain; charset=utf-8').send('No file uploaded as "audio"');
     if (!GROQ_KEY) return res.status(500).type('text/plain; charset=utf-8').send('Missing GROQ_API_KEY');
 
-    const {
-      profileName,
-      preferredName,
-      voiceId: voiceIdRaw,
-      conversationId,
-      hints,
-    } = req.body || {};
-
+    const { profileName, preferredName, voiceId: voiceIdRaw, conversationId, hints } = req.body || {};
     const persona = coalesceName(profileName, preferredName);
     const voiceId = sanitizeVoiceId(voiceIdRaw);
 
@@ -287,7 +333,6 @@ app.post('/voice', upload.single('audio'), async (req, res) => {
     sttFd.append('file', audioBlob, req.file.originalname || 'audio.wav');
     sttFd.append('model', STT_MODEL);
     sttFd.append('response_format', 'verbose_json');
-
     const sttResp = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
       method: 'POST',
       headers: { Authorization: `Bearer ${GROQ_KEY}` },
@@ -303,15 +348,13 @@ app.post('/voice', upload.single('audio'), async (req, res) => {
     const langCode = (sttJson?.language || '').trim();
     const langName = languageLabel(langCode || '');
 
-    // 1.5) Pull latest location DEBUG + context for Groq
+    // 1.5) Latest location (debug headers)
     const userId = 'kavish';
     const latestKey = `loc:${userId}`;
     const latest = await storeGet(latestKey);
-    let debugPlace = '';
     if (latest && typeof latest.latitude === 'number' && typeof latest.longitude === 'number') {
       const geo = await reverseGeocode(latest.latitude, latest.longitude).catch(() => null);
-      debugPlace = formatAddressLine(geo?.address) || geo?.display_name || '';
-      // Set debug headers so you can see it in the network response
+      const debugPlace = formatAddressLine(geo?.address) || geo?.display_name || '';
       res.setHeader('X-Location-Coords', `${latest.latitude},${latest.longitude}`);
       res.setHeader('X-Location-AgeMs', String(Date.now() - (latest.updatedAt ?? latest.timestamp ?? 0)));
       if (debugPlace) res.setHeader('X-Location-Place', encodeURIComponent(debugPlace));
@@ -388,28 +431,10 @@ app.post('/voice', upload.single('audio'), async (req, res) => {
       .send(JSON.stringify({ error: 'Server error', detail: String(err?.message || err) }));
   }
 });
-// === Add below your storeSet/storeGet helpers ===
-function storeKind() {
-  return kv ? 'kv' : 'mem';
-}
 
-// === Add this tiny route to see which store is active ===
-app.get('/location/store-info', (_req, res) => {
-  res.json({ store: storeKind() });
-});
-
-// === Add this route to inject a test point quickly ===
-app.get('/location/mock', async (req, res) => {
-  const lat = parseFloat(req.query.lat);
-  const lon = parseFloat(req.query.lon);
-  const acc = req.query.acc ? Number(req.query.acc) : 15;
-  if (Number.isNaN(lat) || Number.isNaN(lon)) return res.status(400).json({ error: 'lat/lon required' });
-  const key = 'loc:kavish';
-  const doc = { latitude: lat, longitude: lon, accuracy: acc, timestamp: Date.now(), updatedAt: Date.now() };
-  await storeSet(key, doc);
-  res.json({ ok: true, store: storeKind(), saved: doc });
-});
-// Local dev: listen. Vercel: export default app.
+/* ──────────────────────────────────────────────────────────────
+ * Local dev vs Vercel export
+ * ────────────────────────────────────────────────────────────── */
 if (!isVercel) {
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => console.log(`✅ Voice API listening on http://localhost:${PORT}`));
