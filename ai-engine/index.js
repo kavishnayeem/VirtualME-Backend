@@ -4,9 +4,6 @@ import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
 
-// Node 18+ has global fetch/Blob/FormData (undici).
-// If you're on older Node, install undici or form-data & cross-blob.
-
 const app = express();
 app.use(express.json({ limit: '1mb', type: ['application/json', 'text/json'] }));
 app.use(cors({ origin: '*', allowedHeaders: ['Content-Type', 'Accept', 'Accept-Charset'] }));
@@ -15,7 +12,6 @@ const GROQ_KEY   = process.env.GROQ_API_KEY;
 const ELEVEN_URL = process.env.VOICE_BACKEND_BASE || 'https://virtual-me-backend.vercel.app';
 const DEFAULT_VOICE_ID = process.env.VOICE_ID || 'FXeTfnSWNOAh4GQOUctK';
 
-// Speedy models you requested
 const STT_MODEL  = process.env.GROQ_STT_MODEL  || 'whisper-large-v3-turbo';
 const CHAT_MODEL = process.env.GROQ_CHAT_MODEL || 'llama-3.1-8b-instant';
 const MAX_TOKENS = Number(process.env.MAX_TOKENS || 768);
@@ -23,15 +19,12 @@ const MAX_TOKENS = Number(process.env.MAX_TOKENS || 768);
 const isVercel = process.env.VERCEL === '1';
 if (!GROQ_KEY) console.warn('⚠️ Missing GROQ_API_KEY');
 
-/** ──────────────────────────────────────────────────────────────
+/* ──────────────────────────────────────────────────────────────
  * Conversation memory (in-memory LRU per conversationId)
- * - Frontend should send a stable conversationId (e.g., device/session UUID).
- * - We keep last 10 turns, TTL 30 minutes.
- * - NOTE: Will reset on server restart / scale.
  * ────────────────────────────────────────────────────────────── */
 const CONVO_TTL_MS = 30 * 60 * 1000;
 const CONVO_MAX_TURNS = 10;
-const conversations = new Map(); // cid -> { messages: [ {role, content} ], updatedAt }
+const conversations = new Map();
 
 function getHistory(cid) {
   if (!cid) return [];
@@ -43,15 +36,12 @@ function getHistory(cid) {
   }
   return slot.messages || [];
 }
-
 function appendToHistory(cid, msgs) {
   if (!cid) return;
   const prev = getHistory(cid);
-  const merged = [...prev, ...msgs].slice(-CONVO_MAX_TURNS * 2); // roughly user+assistant pairs
+  const merged = [...prev, ...msgs].slice(-CONVO_MAX_TURNS * 2);
   conversations.set(cid, { messages: merged, updatedAt: Date.now() });
 }
-
-// periodic GC
 setInterval(() => {
   const now = Date.now();
   for (const [cid, slot] of conversations.entries()) {
@@ -59,7 +49,7 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000).unref();
 
-/** ──────────────────────────────────────────────────────────────
+/* ──────────────────────────────────────────────────────────────
  * Multer for audio
  * ────────────────────────────────────────────────────────────── */
 const upload = multer({
@@ -71,20 +61,15 @@ const upload = multer({
   },
 });
 
-/** ──────────────────────────────────────────────────────────────
+/* ──────────────────────────────────────────────────────────────
  * KV (Upstash/@vercel/kv) optional + in-memory fallback
  * ────────────────────────────────────────────────────────────── */
 let kv = null;
 try {
-  // npm i @vercel/kv  (optional)
-  // Top-level await requires "type":"module" in package.json (you likely have it already).
   const mod = await import('@vercel/kv').catch(() => null);
   if (mod?.kv) kv = mod.kv;
-} catch { /* ignore */ }
-
-// Simple in-memory fallback (dev only; resets on redeploy)
+} catch {}
 const mem = Object.create(null);
-
 async function storeSet(key, value) {
   if (kv) { await kv.set(key, value); return; }
   mem[key] = value;
@@ -94,8 +79,8 @@ async function storeGet(key) {
   return mem[key] ?? null;
 }
 
-/** ──────────────────────────────────────────────────────────────
- * Reverse geocoding helper (optional, best-effort; cache if needed)
+/* ──────────────────────────────────────────────────────────────
+ * Reverse geocoding (returns display_name + address components)
  * ────────────────────────────────────────────────────────────── */
 async function reverseGeocode(lat, lon) {
   try {
@@ -103,13 +88,35 @@ async function reverseGeocode(lat, lon) {
     const resp = await fetch(url, { headers: { 'User-Agent': 'VirtualMe/1.0' } });
     if (!resp.ok) return null;
     const j = await resp.json();
-    return j?.display_name || null;
+    return {
+      display_name: j?.display_name || null,
+      address: j?.address || null
+    };
   } catch {
     return null;
   }
 }
+function formatAddressLine(address) {
+  if (!address) return null;
+  // Try to build a compact street → area → city → state string
+  const parts = [
+    address.road || address.pedestrian || address.path || address.cycleway || address.footway,
+    address.neighbourhood || address.suburb || address.village || address.town || address.city_district,
+    address.city || address.town || address.village || address.county,
+    address.state,
+    address.postcode
+  ].filter(Boolean);
+  return parts.length ? parts.join(', ') : null;
+}
+function timeAgo(ms) {
+  const m = Math.round(ms / 60000);
+  if (m <= 1) return 'just now';
+  if (m < 60) return `${m} minute(s) ago`;
+  const h = Math.round(m / 60);
+  return `${h} hour(s) ago`;
+}
 
-/** ──────────────────────────────────────────────────────────────
+/* ──────────────────────────────────────────────────────────────
  * Root + health
  * ────────────────────────────────────────────────────────────── */
 app.get('/', (_req, res) => {
@@ -122,18 +129,18 @@ POST /voice  (multipart form-data: audio=<file>, optional: profileName, preferre
 Location:
 POST /location/update   { payload: { latitude, longitude, timestamp, accuracy?, speed?, heading?, altitude? } }
 GET  /location/latest?userId=kavish
+GET  /location/debug?userId=kavish  -> human string for quick testing
 
 Models:
   STT:  ${STT_MODEL}
   Chat: ${CHAT_MODEL}  (max_tokens=${MAX_TOKENS})
 `);
 });
-
 app.get('/healthz', (_req, res) =>
   res.type('application/json; charset=utf-8').send(JSON.stringify({ ok: true }))
 );
 
-/** ──────────────────────────────────────────────────────────────
+/* ──────────────────────────────────────────────────────────────
  * Language + persona helpers
  * ────────────────────────────────────────────────────────────── */
 function coalesceName(profileName, preferredName) {
@@ -141,13 +148,11 @@ function coalesceName(profileName, preferredName) {
   const short = (preferredName || 'Kavish').trim();
   return { full, short };
 }
-
 function sanitizeVoiceId(voiceId) {
   if (!voiceId) return DEFAULT_VOICE_ID;
   if (!/^[A-Za-z0-9\-_]{6,64}$/.test(voiceId)) return DEFAULT_VOICE_ID;
   return voiceId;
 }
-
 function languageLabel(code) {
   if (!code) return 'the same language as the user';
   const m = code.toLowerCase();
@@ -159,7 +164,6 @@ function languageLabel(code) {
   };
   return map[m] || code;
 }
-
 function buildSystemPrompt({ full, short }, languageName) {
   return [
     `You are the person "${full}" (preferred name: "${short}").`,
@@ -172,37 +176,26 @@ function buildSystemPrompt({ full, short }, languageName) {
   ].join(' ');
 }
 
-/** ──────────────────────────────────────────────────────────────
- * LOCATION ENDPOINTS (no auth for now, per your request)
- * Phone pushes latest location → Server stores → Any client fetches latest
+/* ──────────────────────────────────────────────────────────────
+ * LOCATION ENDPOINTS (no auth for now)
  * ────────────────────────────────────────────────────────────── */
-
-// Phone → Server: update latest location
-// Body: { payload: { latitude, longitude, timestamp, accuracy?, speed?, heading?, altitude? } }
 app.post('/location/update', async (req, res) => {
   try {
     const { payload } = req.body || {};
-    if (
-      !payload ||
-      typeof payload.latitude !== 'number' ||
-      typeof payload.longitude !== 'number' ||
-      typeof payload.timestamp !== 'number'
-    ) {
+    if (!payload || typeof payload.latitude !== 'number' || typeof payload.longitude !== 'number' || typeof payload.timestamp !== 'number') {
       return res.status(400).json({ error: 'invalid payload' });
     }
-
-    // For now, single-user "kavish". Later, derive from auth.
     const key = `loc:kavish`;
     const doc = { ...payload, updatedAt: Date.now() };
     await storeSet(key, doc);
+    // console log for quick debugging
+    console.log('[location:update]', doc);
     return res.json({ ok: true });
   } catch (e) {
     return res.status(500).json({ error: 'server', detail: String(e?.message || e) });
   }
 });
 
-// Any client → Server: read latest location
-// Query: ?userId=kavish
 app.get('/location/latest', async (req, res) => {
   try {
     const userId = String(req.query.userId || 'kavish');
@@ -212,8 +205,11 @@ app.get('/location/latest', async (req, res) => {
 
     const ageMs = Date.now() - (data.updatedAt ?? data.timestamp ?? 0);
     let place = null;
+    let address = null;
     if (typeof data.latitude === 'number' && typeof data.longitude === 'number') {
-      place = await reverseGeocode(data.latitude, data.longitude).catch(() => null);
+      const geo = await reverseGeocode(data.latitude, data.longitude).catch(() => null);
+      place = geo?.display_name || null;
+      address = geo?.address || null;
     }
 
     return res.json({
@@ -223,15 +219,49 @@ app.get('/location/latest', async (req, res) => {
       accuracy: data.accuracy ?? null,
       updatedAt: data.updatedAt ?? data.timestamp,
       ageMs,
-      place // e.g., "Corpus Christi, Texas, United States"
+      place,
+      address
     });
   } catch (e) {
     return res.status(500).json({ error: 'server', detail: String(e?.message || e) });
   }
 });
 
-/** ──────────────────────────────────────────────────────────────
- * VOICE: audio → STT → chat → TTS
+/* Human-readable debug string: great for quick checks in the browser */
+app.get('/location/debug', async (req, res) => {
+  try {
+    const userId = String(req.query.userId || 'kavish');
+    const key = `loc:${userId}`;
+    const data = await storeGet(key);
+    if (!data) return res.type('text/plain').send('No recent location.');
+
+    const ageMs = Date.now() - (data.updatedAt ?? data.timestamp ?? 0);
+    const geo = await reverseGeocode(data.latitude, data.longitude).catch(() => null);
+    const line = formatAddressLine(geo?.address) || geo?.display_name || `${data.latitude}, ${data.longitude}`;
+    return res
+      .type('text/plain; charset=utf-8')
+      .send(`Last seen: ${line} (${timeAgo(ageMs)}) [acc=${data.accuracy ?? 'n/a'}m]`);
+  } catch (e) {
+    return res.status(500).type('text/plain; charset=utf-8').send(`Error: ${String(e?.message || e)}`);
+  }
+});
+
+/* ──────────────────────────────────────────────────────────────
+ * Helper to pull latest location as text for Groq context
+ * ────────────────────────────────────────────────────────────── */
+async function latestLocationText(userId = 'kavish') {
+  const key = `loc:${userId}`;
+  const data = await storeGet(key);
+  if (!data) return 'No recent location is available.';
+
+  const ageMs = Date.now() - (data.updatedAt ?? data.timestamp ?? 0);
+  const geo = await reverseGeocode(data.latitude, data.longitude).catch(() => null);
+  const streety = formatAddressLine(geo?.address) || geo?.display_name || `${data.latitude.toFixed(5)}, ${data.longitude.toFixed(5)}`;
+  return `Last seen near ${streety} (${timeAgo(ageMs)}). Accuracy ~${Math.round(data.accuracy ?? 0)}m.`;
+}
+
+/* ──────────────────────────────────────────────────────────────
+ * VOICE: audio → STT → chat → TTS  (now with location context + debug headers)
  * ────────────────────────────────────────────────────────────── */
 app.post('/voice', upload.single('audio'), async (req, res) => {
   try {
@@ -249,42 +279,58 @@ app.post('/voice', upload.single('audio'), async (req, res) => {
     const persona = coalesceName(profileName, preferredName);
     const voiceId = sanitizeVoiceId(voiceIdRaw);
 
-    // 1) STT (Groq) — ask for verbose_json to get detected language
+    // 1) STT
     const sttFd = new FormData();
     const audioBlob = new Blob([req.file.buffer], { type: req.file.mimetype || 'audio/wav' });
     sttFd.append('file', audioBlob, req.file.originalname || 'audio.wav');
     sttFd.append('model', STT_MODEL);
-    sttFd.append('response_format', 'verbose_json'); // includes "language"
+    sttFd.append('response_format', 'verbose_json');
 
     const sttResp = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
       method: 'POST',
       headers: { Authorization: `Bearer ${GROQ_KEY}` },
       body: sttFd,
     });
-
     if (!sttResp.ok) {
       const errTxt = await sttResp.text();
       return res.status(502).type('application/json; charset=utf-8')
         .send(JSON.stringify({ error: 'STT failed', detail: errTxt }));
     }
-
     const sttJson = await sttResp.json();
     const transcript = (sttJson?.text || '').trim();
     const langCode = (sttJson?.language || '').trim();
     const langName = languageLabel(langCode || '');
 
-    // 2) Messages with history
+    // 1.5) Pull latest location DEBUG + context for Groq
+    const userId = 'kavish';
+    const latestKey = `loc:${userId}`;
+    const latest = await storeGet(latestKey);
+    let debugPlace = '';
+    if (latest && typeof latest.latitude === 'number' && typeof latest.longitude === 'number') {
+      const geo = await reverseGeocode(latest.latitude, latest.longitude).catch(() => null);
+      debugPlace = formatAddressLine(geo?.address) || geo?.display_name || '';
+      // Set debug headers so you can see it in the network response
+      res.setHeader('X-Location-Coords', `${latest.latitude},${latest.longitude}`);
+      res.setHeader('X-Location-AgeMs', String(Date.now() - (latest.updatedAt ?? latest.timestamp ?? 0)));
+      if (debugPlace) res.setHeader('X-Location-Place', encodeURIComponent(debugPlace));
+    } else {
+      res.setHeader('X-Location-Place', encodeURIComponent('NO_LOCATION'));
+    }
+
+    const locText = await latestLocationText(userId);
+
+    // 2) Messages with history + location context
     const history = getHistory(conversationId);
     const systemMsg = buildSystemPrompt(persona, langName);
-
     const messages = [
       { role: 'system', content: systemMsg },
       ...history,
-      ...(hints ? [{ role: 'system', content: `Context/hints from user: ${hints}` }] : []),
+      { role: 'system', content: `Context: ${locText}` },
+      ...(hints ? [{ role: 'system', content: `Extra app context: ${hints}` }] : []),
       { role: 'user', content: transcript || 'Greet politely.' },
     ];
 
-    // 3) Chat (Groq)
+    // 3) Chat
     const chatResp = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -299,13 +345,11 @@ app.post('/voice', upload.single('audio'), async (req, res) => {
         messages,
       }),
     });
-
     if (!chatResp.ok) {
       const errTxt = await chatResp.text();
       return res.status(502).type('application/json; charset=utf-8')
         .send(JSON.stringify({ error: 'Chat failed', detail: errTxt, transcript, messages }));
     }
-
     const chatJson = await chatResp.json();
     const replyText = (chatJson?.choices?.[0]?.message?.content || '').trim()
       || (transcript ? `OK: ${transcript}` : `Hi, I'm ${persona.short}.`);
@@ -316,13 +360,12 @@ app.post('/voice', upload.single('audio'), async (req, res) => {
       { role: 'assistant', content: replyText },
     ]);
 
-    // 5) TTS proxy
+    // 5) TTS
     const ttsResp = await fetch(`${ELEVEN_URL}/speak`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json; charset=utf-8', Accept: 'audio/wav' },
       body: JSON.stringify({ voiceId, text: replyText }),
     });
-
     if (!ttsResp.ok) {
       const t = await ttsResp.text();
       return res.status(ttsResp.status).type('application/json; charset=utf-8')
@@ -349,5 +392,4 @@ if (!isVercel) {
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => console.log(`✅ Voice API listening on http://localhost:${PORT}`));
 }
-
 export default app;
