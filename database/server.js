@@ -16,8 +16,11 @@ const {
   JWT_SECRET = 'change_me',
   GOOGLE_WEB_CLIENT_ID,
   GOOGLE_WEB_CLIENT_SECRET,
+  // Local fallback; in prod we infer from request or PUBLIC_BASE_URL
   BACKEND_BASE = 'http://localhost:4000',
+  // Optional: set to your deployed backend origin to avoid inference
   PUBLIC_BASE_URL,
+  // Optional: restrict postMessage target origin in popup HTML
   WEB_ORIGIN,
 } = process.env;
 
@@ -33,21 +36,20 @@ app.use(cookieParser());
 // --- CORS ---
 const corsOrigins = [
   'http://localhost:8081', // Expo Web dev
-  'http://localhost:19006', // optional Expo web port
-  WEB_ORIGIN,               // optional prod origin
+  'http://localhost:19006', // alt Expo Web port
+  WEB_ORIGIN,               // your prod web app origin (optional)
 ].filter(Boolean);
 
 app.use(
   cors({
     origin: (origin, cb) => {
-      if (!origin) return cb(null, true); // allow curl/postman
+      if (!origin) return cb(null, true);             // curl/postman
       if (corsOrigins.includes(origin)) return cb(null, true);
-      // during bring-up, you can loosen this; for now allow any to avoid confusion:
-      return cb(null, true);
+      return cb(null, true);                           // permissive during bring-up
     },
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
-    credentials: false,
+    credentials: false, // we use Bearer tokens, not cookies
   })
 );
 
@@ -58,7 +60,7 @@ const db = client.db(MONGODB_DB);
 const Users = db.collection('users');
 
 // --- Google OAuth client ---
-// TIP: we won't fix a redirectUri in the constructor; we pass it per-request dynamically.
+// We pass redirect_uri per request dynamically (don’t set in constructor).
 const oauth = new OAuth2Client({
   clientId: GOOGLE_WEB_CLIENT_ID,
   clientSecret: GOOGLE_WEB_CLIENT_SECRET,
@@ -70,8 +72,7 @@ function signSession(userId) {
 }
 
 async function authMiddleware(req, _res, next) {
-  const token =
-    req.headers.authorization?.replace('Bearer ', '') || req.cookies?.vm;
+  const token = req.headers.authorization?.replace('Bearer ', '') || req.cookies?.vm;
   if (!token) return next();
   try {
     const payload = jwt.verify(token, JWT_SECRET);
@@ -81,33 +82,20 @@ async function authMiddleware(req, _res, next) {
 }
 app.use(authMiddleware);
 
-// Build the public base URL for this request (works on Vercel & locally)
+// Build the base URL for redirects (works on Vercel & locally)
 function getBaseFromReq(req) {
-  // Highest priority: explicit PUBLIC_BASE_URL env
   if (PUBLIC_BASE_URL) return PUBLIC_BASE_URL.replace(/\/$/, '');
-  // Vercel / proxy headers
   const proto = (req.headers['x-forwarded-proto'] || 'http').toString();
   const host = (req.headers['x-forwarded-host'] || req.headers.host || '').toString();
   if (host) return `${proto}://${host}`.replace(/\/$/, '');
-  // Fallback: local env var
   return BACKEND_BASE.replace(/\/$/, '');
-}
-
-// On Vercel, our routes are served under /api/*.
-// Tell Google to send users back to /api/auth/callback on Vercel, and /auth/callback locally.
-function getPathPrefix() {
-  return process.env.VERCEL ? '/api' : '';
 }
 
 function sendSessionJson(res, userDoc) {
   const token = signSession(userDoc._id.toString());
   res.json({
     token,
-    user: {
-      name: userDoc.name,
-      email: userDoc.email,
-      picture: userDoc.picture,
-    },
+    user: { name: userDoc.name, email: userDoc.email, picture: userDoc.picture },
   });
 }
 
@@ -115,13 +103,12 @@ function sendSessionJson(res, userDoc) {
 app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
 app.get('/', (_req, res) => res.send('OK'));
 
-// ---------- WEB POPUP FLOW (works local & Vercel) ----------
+// ---------- WEB POPUP FLOW (root paths; no /api) ----------
 
 // Step 1: Start OAuth → redirect to Google
 app.get('/auth/google/start', (req, res) => {
   const base = getBaseFromReq(req);
-  const prefix = getPathPrefix();
-  const redirectUri = `${base}${prefix}/auth/callback`;
+  const redirectUri = `${base}/auth/callback`; // << root callback
 
   const scopes = [
     'openid',
@@ -129,13 +116,14 @@ app.get('/auth/google/start', (req, res) => {
     'profile',
     'https://www.googleapis.com/auth/calendar.readonly',
   ];
+
   const url = oauth.generateAuthUrl({
     access_type: 'offline',
     prompt: 'consent',
     scope: scopes,
     redirect_uri: redirectUri,
   });
-  // Debug (server logs)
+
   console.log('[OAUTH start] redirect_uri =', redirectUri);
   res.redirect(url);
 });
@@ -144,8 +132,7 @@ app.get('/auth/google/start', (req, res) => {
 app.get('/auth/callback', async (req, res) => {
   try {
     const base = getBaseFromReq(req);
-    const prefix = getPathPrefix();
-    const redirectUri = `${base}${prefix}/auth/callback`;
+    const redirectUri = `${base}/auth/callback`; // << root callback
 
     const { code } = req.query;
     if (!code) return res.status(400).send('Missing code');
@@ -155,10 +142,7 @@ app.get('/auth/callback', async (req, res) => {
     const idToken = tokens.id_token;
     if (!idToken) return res.status(400).send('No id_token');
 
-    const ticket = await oauth.verifyIdToken({
-      idToken,
-      audience: GOOGLE_WEB_CLIENT_ID,
-    });
+    const ticket = await oauth.verifyIdToken({ idToken, audience: GOOGLE_WEB_CLIENT_ID });
     const p = ticket.getPayload();
 
     const update = {
@@ -174,7 +158,7 @@ app.get('/auth/callback', async (req, res) => {
 
     let doc = await Users.findOne({ googleId: p.sub });
     if (doc) {
-      if (!update.refreshToken) delete update.refreshToken;
+      if (!update.refreshToken) delete update.refreshToken; // keep existing refresh if not returned
       await Users.updateOne({ _id: doc._id }, { $set: update });
       doc = await Users.findOne({ _id: doc._id });
     } else {
@@ -186,6 +170,7 @@ app.get('/auth/callback', async (req, res) => {
     const token = signSession(doc._id.toString());
 
     // Post session to opener and close popup
+    const targetOrigin = WEB_ORIGIN || '*';
     res
       .set('Content-Type', 'text/html')
       .send(`<!doctype html><meta charset="utf-8" />
@@ -195,8 +180,7 @@ app.get('/auth/callback', async (req, res) => {
       token,
       user: { name: doc.name, email: doc.email, picture: doc.picture },
     })};
-    // If you want to restrict origin in prod, replace '*' with '${WEB_ORIGIN || ''}'
-    if (window.opener) window.opener.postMessage({ type: 'vm-auth', payload }, '*');
+    if (window.opener) window.opener.postMessage({ type: 'vm-auth', payload }, '${targetOrigin}');
     window.close();
   })();
 </script>
@@ -229,6 +213,7 @@ app.get('/calendar/next', async (req, res) => {
       refresh_token: user.refreshToken,
     });
 
+    // Refresh if missing/expired
     if (!user.accessToken || !user.tokenExpiry || user.tokenExpiry < new Date()) {
       const { credentials } = await oauth.refreshAccessToken();
       await Users.updateOne(
