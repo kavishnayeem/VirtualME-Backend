@@ -161,10 +161,16 @@ app.get('/auth/callback', async (req, res) => {
   })();
 </script>
 <p>You can close this window.</p>`);
-  } catch (e) {
-    console.error(e);
-    res.status(500).send('OAuth callback failed');
-  }
+} catch (e) {
+  console.error('[OAUTH CALLBACK ERROR]', {
+    message: e?.message,
+    code: e?.code,
+    stack: e?.stack,
+    errors: e?.errors,
+    response: e?.response?.data,
+  });
+  res.status(500).send('OAuth callback failed');
+}
 });
 
 // ---------- Me (protected) ----------
