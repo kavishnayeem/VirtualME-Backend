@@ -169,7 +169,7 @@ app.get('/auth/callback', async (req, res) => {
     errors: e?.errors,
     response: e?.response?.data,
   });
-  res.status(500).send('OAuth callback failed');
+  res.status(500).send(e);
 }
 });
 
