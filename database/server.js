@@ -181,27 +181,49 @@ app.get('/me', async (req, res) => {
 });
 
 // Update profile (protected)
+// --- Update profile (protected) ---
 app.put('/me', async (req, res) => {
   try {
-    if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
-    const body = req.body || {};
-    const p = sanitizeProfile(body.profile || {});
+    if (!req.userId) {
+      console.warn('[PUT /me] no req.userId (missing/invalid token)');
+      return res.status(401).json({ error: 'unauthorized' });
+    }
 
-    const up = await Users.findOneAndUpdate(
-      { _id: new ObjectId(req.userId) },
-      { $set: { profile: p, updatedAt: new Date() } },
-      { returnDocument: 'after' }
+    const _id = new ObjectId(req.userId);
+    const existing = await Users.findOne({ _id }, { projection: { _id: 1 } });
+    if (!existing) {
+      console.warn('[PUT /me] user not found for _id:', req.userId);
+      return res.status(404).json({ error: 'user not found' });
+    }
+
+    const profile = sanitizeProfile((req.body && req.body.profile) || {});
+    const result = await Users.updateOne(
+      { _id },
+      { $set: { profile, updatedAt: new Date() } }
     );
 
-    if (!up.value) return res.status(404).json({ error: 'user not found' });
+    if (!result.acknowledged) {
+      console.error('[PUT /me] update not acknowledged for _id:', req.userId);
+      return res.status(500).json({ error: 'update failed' });
+    }
 
-    const doc = up.value;
-    res.json({ _id: doc._id, name: doc.name, email: doc.email, picture: doc.picture, profile: doc.profile || { ...EMPTY_PROFILE } });
+    const doc = await Users.findOne(
+      { _id },
+      { projection: { name: 1, email: 1, picture: 1, profile: 1 } }
+    );
+    return res.json({
+      _id: doc._id,
+      name: doc.name,
+      email: doc.email,
+      picture: doc.picture,
+      profile: doc.profile || { ...EMPTY_PROFILE },
+    });
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'update failed' });
+    console.error('[PROFILE UPDATE ERROR]', e);
+    return res.status(500).json({ error: 'update failed' });
   }
 });
+
 
 function sanitizeProfile(raw) {
   const out = { ...EMPTY_PROFILE };
