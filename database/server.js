@@ -103,76 +103,70 @@ app.get('/auth/google/start', (req, res) => {
   res.redirect(url);
 });
 
-// ---------- OAuth callback: upsert user + ensure profile ----------
+// ---------- OAuth callback (fixed) ----------
 app.get('/auth/callback', async (req, res) => {
   try {
-    const base = getBaseFromReq(req);
-    const redirectUri = `${base}/auth/callback`;
-
-    const { code } = req.query;
-    if (!code) return res.status(400).send('Missing code');
-
-    const { tokens } = await oauth.getToken({ code, redirect_uri: redirectUri });
-    const idToken = tokens.id_token;
-    if (!idToken) return res.status(400).send('No id_token');
-
-    const ticket = await oauth.verifyIdToken({ idToken, audience: GOOGLE_WEB_CLIENT_ID });
-    const p = ticket.getPayload();
-
-    const baseUpdate = {
-      googleId: p.sub,
-      email: p.email,
-      name: p.name,
-      picture: p.picture,
-      refreshToken: tokens.refresh_token ?? undefined,
-      accessToken: tokens.access_token ?? undefined,
-      tokenExpiry: tokens.expiry_date ? new Date(tokens.expiry_date) : undefined,
-      updatedAt: new Date(),
-    };
-
-    // Upsert & ensure profile exists on insert
-    const up = await Users.findOneAndUpdate(
-      { googleId: p.sub },
-      {
-        $set: baseUpdate,
-        $setOnInsert: {
-          createdAt: new Date(),
-          profile: { ...EMPTY_PROFILE },
-        },
-      },
-      { returnDocument: 'after', upsert: true }
-    );
-
-    const doc = up.value;
-    const token = signSession(doc._id.toString());
-    const targetOrigin = WEB_ORIGIN || '*';
-
-    res
-      .set('Content-Type', 'text/html')
-      .send(`<!doctype html><meta charset="utf-8" />
-<script>
-  (function() {
-    var payload = ${JSON.stringify({
-      token,
-      user: { name: doc.name, email: doc.email, picture: doc.picture },
-    })};
-    if (window.opener) window.opener.postMessage({ type: 'vm-auth', payload }, '${targetOrigin}');
-    window.close();
+  const base = PUBLIC_BASE_URL || BACKEND_BASE;
+  const redirectUri = `${base}/auth/callback`;
+  
+  
+  const { code } = req.query;
+  if (!code) return res.status(400).send('Missing code');
+  
+  
+  const { tokens } = await oauth.getToken({ code, redirect_uri: redirectUri });
+  if (!tokens.id_token) return res.status(400).send('No id_token');
+  
+  
+  const ticket = await oauth.verifyIdToken({ idToken: tokens.id_token, audience: GOOGLE_WEB_CLIENT_ID });
+  const p = ticket.getPayload();
+  
+  
+  const update = {
+  googleId: p.sub,
+  email: p.email,
+  name: p.name,
+  picture: p.picture,
+  refreshToken: tokens.refresh_token ?? undefined,
+  accessToken: tokens.access_token ?? undefined,
+  tokenExpiry: tokens.expiry_date ? new Date(tokens.expiry_date) : undefined,
+  updatedAt: new Date(),
+  };
+  
+  
+  // ✅ Upsert then fetch explicitly (driver‑safe)
+  await Users.updateOne(
+  { googleId: p.sub },
+  { $set: update, $setOnInsert: { createdAt: new Date(), profile: { ...EMPTY_PROFILE } } },
+  { upsert: true }
+  );
+  
+  
+  const doc = await Users.findOne({ googleId: p.sub });
+  if (!doc) return res.status(500).send('User insert failed');
+  
+  
+  const token = signSession(doc._id.toString());
+  const targetOrigin = WEB_ORIGIN || '*';
+  
+  
+  res.set('Content-Type', 'text/html').send(`<!doctype html><meta charset="utf-8" />
+  <script>
+  (function(){
+  var payload = ${JSON.stringify({
+  token,
+  user: { name: doc.name, email: doc.email, picture: doc.picture },
+  })};
+  if (window.opener) window.opener.postMessage({ type: 'vm-auth', payload }, '${targetOrigin}');
+  window.close();
   })();
-</script>
-<p>You can close this window.</p>`);
-} catch (e) {
-  console.error('[OAUTH CALLBACK ERROR]', {
-    message: e?.message,
-    code: e?.code,
-    stack: e?.stack,
-    errors: e?.errors,
-    response: e?.response?.data,
+  </script>
+  <p>You can close this window.</p>`);
+  } catch (e) {
+  console.error('[OAUTH CALLBACK ERROR]', e);
+  res.status(500).send('OAuth callback failed');
+  }
   });
-  res.status(500).send(e);
-}
-});
-
 // ---------- Me (protected) ----------
 app.get('/me', async (req, res) => {
   if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
