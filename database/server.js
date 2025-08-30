@@ -99,7 +99,16 @@ app.get('/auth/google/start', (req, res) => {
   const base = getBaseFromReq(req);
   const redirectUri = `${base}/auth/callback`;
   const scopes = ['openid', 'email', 'profile', 'https://www.googleapis.com/auth/calendar.readonly'];
-  const url = oauth.generateAuthUrl({ access_type: 'offline', prompt: 'consent', scope: scopes, redirect_uri: redirectUri });
+  const { app_redirect } = req.query;
+ const stateObj = app_redirect ? { app_redirect } : null;
+ const state = stateObj ? Buffer.from(JSON.stringify(stateObj)).toString('base64url') : undefined;
+ const url = oauth.generateAuthUrl({
+   access_type: 'offline',
+   prompt: 'consent',
+   scope: scopes,
+   redirect_uri: redirectUri,
+   ...(state ? { state } : {}),
+ });
   res.redirect(url);
 });
 
@@ -110,7 +119,7 @@ app.get('/auth/callback', async (req, res) => {
   const redirectUri = `${base}/auth/callback`;
   
   
-  const { code } = req.query;
+  const { code, state } = req.query;
   if (!code) return res.status(400).send('Missing code');
   
   
@@ -146,22 +155,46 @@ app.get('/auth/callback', async (req, res) => {
   if (!doc) return res.status(500).send('User insert failed');
   
   
-  const token = signSession(doc._id.toString());
-  const targetOrigin = WEB_ORIGIN || '*';
   
-  
-  res.set('Content-Type', 'text/html').send(`<!doctype html><meta charset="utf-8" />
-  <script>
-  (function(){
-  var payload = ${JSON.stringify({
-  token,
-  user: { name: doc.name, email: doc.email, picture: doc.picture },
-  })};
-  if (window.opener) window.opener.postMessage({ type: 'vm-auth', payload }, '${targetOrigin}');
-  window.close();
-  })();
-  </script>
-  <p>You can close this window.</p>`);
+     const token = signSession(doc._id.toString());
+   const userPayload = { name: doc.name, email: doc.email, picture: doc.picture };
+
+   // Native deep link
+   let appRedirect = null;
+   if (state && typeof state === 'string') {
+     try {
+       const parsed = JSON.parse(Buffer.from(state, 'base64url').toString('utf8'));
+       if (parsed?.app_redirect && typeof parsed.app_redirect === 'string') {
+         appRedirect = parsed.app_redirect;
+       }
+     } catch {}
+   }
+   if (appRedirect) {
+    const url = `${appRedirect}?token=${encodeURIComponent(token)}&user=${encodeURIComponent(JSON.stringify(userPayload))}`;
+     return res
+       .set('Content-Type', 'text/html')
+       .send(`<!doctype html><meta charset="utf-8" />
+<script>
+  // Deep link back to the app, then close the tab
+  window.location.href = ${JSON.stringify(url)};
+  setTimeout(function(){ window.close(); }, 750);
+</script>
+<p>Returning to the app…</p>`);
+   }
+
+   // Web popup fallback (unchanged)
+   const targetOrigin = WEB_ORIGIN || '*';
+   return res
+     .set('Content-Type','text/html')
+     .send(`<!doctype html><meta charset="utf-8" />
+<script>
+ (function(){
+   var payload = ${JSON.stringify({ token, user: userPayload })};
+   if (window.opener) window.opener.postMessage({ type: 'vm-auth', payload }, '${targetOrigin}');
+   window.close();
+ })();
+</script>
+<p>You can close this window.</p>`);
   } catch (e) {
   console.error('[OAUTH CALLBACK ERROR]', e);
   res.status(500).send('OAuth callback failed');
