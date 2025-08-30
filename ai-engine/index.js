@@ -204,10 +204,10 @@ function coalesceName(profileName, preferredName) {
   return { full, short };
 }
 function sanitizeVoiceId(voiceId) {
-  if (!voiceId) return DEFAULT_VOICE_ID;
-  if (!/^[A-Za-z0-9\-_]{6,64}$/.test(voiceId)) return DEFAULT_VOICE_ID;
-  return voiceId;
-}
+    if (!voiceId) return ''; // let backend decide per-user/default fallback
+    if (!/^[A-Za-z0-9\-_]{6,64}$/.test(voiceId)) return '';
+    return voiceId;
+  }
 function languageLabel(code) {
   if (!code) return 'the same language as the user';
   const m = code.toLowerCase();
@@ -323,7 +323,10 @@ app.post('/voice', upload.single('audio'), async (req, res) => {
     if (!req.file) return res.status(400).type('text/plain; charset=utf-8').send('No file uploaded as "audio"');
     if (!GROQ_KEY) return res.status(500).type('text/plain; charset=utf-8').send('Missing GROQ_API_KEY');
 
-    const { profileName, preferredName, voiceId: voiceIdRaw, conversationId, hints } = req.body || {};
+       const { profileName, preferredName, voiceId: voiceIdRaw, conversationId, hints, authToken } = req.body || {};
+       // Grab Authorization header if present (e.g., "Bearer x.y.z")
+       const bearer = req.headers.authorization || (authToken ? `Bearer ${authToken}` : '');
+    
     const persona = coalesceName(profileName, preferredName);
     const voiceId = sanitizeVoiceId(voiceIdRaw);
 
@@ -410,6 +413,13 @@ app.post('/voice', upload.single('audio'), async (req, res) => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json; charset=utf-8', Accept: 'audio/wav' },
       body: JSON.stringify({ voiceId, text: replyText }),
+           headers: {
+               'Content-Type': 'application/json; charset=utf-8',
+               Accept: 'audio/wav',
+               ...(bearer ? { Authorization: bearer } : {}),
+             },
+             // If we have a valid voiceId, include it; else omit it so backend uses user/default
+             body: JSON.stringify(voiceId ? { voiceId, text: replyText } : { text: replyText }),
     });
     if (!ttsResp.ok) {
       const t = await ttsResp.text();
