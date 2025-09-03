@@ -28,33 +28,25 @@ const app = express();
 app.use(express.json());
 app.use(cookieParser());
 
-const corsOrigins = [
-  'http://localhost:8081',
-  'http://localhost:19006',
-  WEB_ORIGIN,
-].filter(Boolean);
+const corsOrigins = true; // Allow all origins (connect from anywhere)
 
-app.use(
-  cors({
-    origin: (origin, cb) => {
-      if (!origin) return cb(null, true);
-      if (corsOrigins.includes(origin)) return cb(null, true);
-      return cb(null, true);
-    },
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
-    credentials: false,
-  })
-);
+app.use(cors({
+  origin: true,
+  methods: ['GET','POST','PUT','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization'],
+  credentials: false,
+}));
 
 // --- Mongo ---
 const client = new MongoClient(MONGODB_URI);
 await client.connect();
 const db = client.db(MONGODB_DB);
 const Users = db.collection('users');
-
+const BASE = (process.env.PUBLIC_BASE_URL || process.env.BACKEND_BASE || '').replace(/\/$/, '');
+if (!BASE) throw new Error('Set PUBLIC_BASE_URL to your deployed origin, e.g. https://virtual-me-auth.vercel.app');
+const REDIRECT_URI = `${BASE}/auth/callback`;
 const oauth = new OAuth2Client({ clientId: GOOGLE_WEB_CLIENT_ID, clientSecret: GOOGLE_WEB_CLIENT_SECRET });
-
+console.log('[OAUTH] REDIRECT_URI', REDIRECT_URI);
 function signSession(userId) { return jwt.sign({ uid: userId }, JWT_SECRET, { expiresIn: '30d' }); }
 
 async function authMiddleware(req, _res, next) {
@@ -96,8 +88,8 @@ app.get('/', (_req, res) => res.send('OK'));
 
 // ---------- OAuth start ----------
 app.get('/auth/google/start', (req, res) => {
-  const base = getBaseFromReq(req);
-  const redirectUri = `${base}/auth/callback`;
+  
+  const redirectUri = REDIRECT_URI;
   const scopes = ['openid', 'email', 'profile', 'https://www.googleapis.com/auth/calendar.readonly'];
   const { app_redirect } = req.query;
  const stateObj = app_redirect ? { app_redirect } : null;
@@ -115,8 +107,8 @@ app.get('/auth/google/start', (req, res) => {
 // ---------- OAuth callback (fixed) ----------
 app.get('/auth/callback', async (req, res) => {
   try {
-  const base = PUBLIC_BASE_URL || BACKEND_BASE;
-  const redirectUri = `${base}/auth/callback`;
+ 
+  const redirectUri = REDIRECT_URI;
   
   
   const { code, state } = req.query;
