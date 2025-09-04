@@ -1,4 +1,6 @@
-// server.js
+// server.js (database/auth)
+// Deploy: https://virtual-me-auth.vercel.app
+// ESM module. Node 18+. MongoDB official driver.
 
 import express from 'express';
 import cors from 'cors';
@@ -14,27 +16,26 @@ dotenv.config();
 const {
   MONGODB_URI,
   MONGODB_DB,
-  JWT_SECRET ,
+  JWT_SECRET,
   GOOGLE_WEB_CLIENT_ID,
-  GOOGLE_WEB_CLIENT_SECRET, 
+  GOOGLE_WEB_CLIENT_SECRET,
   PUBLIC_BASE_URL,
   WEB_ORIGIN = '*',
 } = process.env;
 
 if (!MONGODB_URI) throw new Error('Missing MONGODB_URI');
+if (!MONGODB_DB) throw new Error('Missing MONGODB_DB');
+if (!JWT_SECRET) throw new Error('Missing JWT_SECRET');
 if (!GOOGLE_WEB_CLIENT_ID) throw new Error('Missing GOOGLE_WEB_CLIENT_ID');
-if (!PUBLIC_BASE_URL) throw new Error('Missing PUBLIC_BASE_URL (e.g., https://virtual-me-auth.vercel.app)');
+if (!PUBLIC_BASE_URL) throw new Error('Missing PUBLIC_BASE_URL');
 
-// Single source of truth for redirect
 const BASE = PUBLIC_BASE_URL.replace(/\/$/, '');
 const REDIRECT_URI = `${BASE}/auth/callback`;
 
-/** -------- APP -------- */
+// ---------- App ----------
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 app.use(cookieParser());
-
-// CORS: allow all origins (no cookies used)
 app.use(
   cors({
     origin: true,
@@ -44,17 +45,16 @@ app.use(
   })
 );
 
-/** -------- DB -------- */
+// ---------- DB ----------
 const client = new MongoClient(MONGODB_URI);
 await client.connect();
 const db = client.db(MONGODB_DB);
-const Users = db.collection('users');
+const Users   = db.collection('users');
+const Devices = db.collection('devices');
+const Grants  = db.collection('grants'); // Lobby: ownerId -> guestId permissions
 
-/** -------- GOOGLE OAuth Clients -------- */
-// For verifying idToken (native) AND web popup code flow verifyIdToken
+// ---------- OAuth ----------
 const oauthVerify = new OAuth2Client({ clientId: GOOGLE_WEB_CLIENT_ID });
-
-// For WEB popup code flow (exchange auth code -> tokens)
 const oauthWeb =
   GOOGLE_WEB_CLIENT_SECRET
     ? new OAuth2Client({
@@ -64,25 +64,7 @@ const oauthWeb =
       })
     : null;
 
-/** -------- HELPERS -------- */
-function signSession(userId) {
-  return jwt.sign({ uid: userId }, JWT_SECRET, { expiresIn: '30d' });
-}
-
-async function authMiddleware(req, _res, next) {
-  const token = req.headers.authorization?.replace('Bearer ', '') || req.cookies?.vm;
-  if (token) {
-    try {
-      const payload = jwt.verify(token, JWT_SECRET);
-      req.userId = payload.uid;
-    } catch {
-      // ignore
-    }
-  }
-  next();
-}
-app.use(authMiddleware);
-
+// ---------- Helpers ----------
 const EMPTY_PROFILE = Object.freeze({
   character: '',
   homeAddress: '',
@@ -95,7 +77,6 @@ const EMPTY_PROFILE = Object.freeze({
   calendarPrefs: '',
   locationSharingOptIn: false,
 });
-
 function sanitizeProfile(raw) {
   const out = { ...EMPTY_PROFILE };
   if (typeof raw.character === 'string') out.character = raw.character.slice(0, 500);
@@ -110,21 +91,36 @@ function sanitizeProfile(raw) {
   if (typeof raw.locationSharingOptIn === 'boolean') out.locationSharingOptIn = raw.locationSharingOptIn;
   return out;
 }
+function signSession(userId) {
+  return jwt.sign({ uid: userId }, JWT_SECRET, { expiresIn: '30d' });
+}
+async function authMiddleware(req, _res, next) {
+  const token = req.headers.authorization?.replace('Bearer ', '') || req.cookies?.vm;
+  if (token) {
+    try {
+      const payload = jwt.verify(token, JWT_SECRET);
+      req.userId = payload.uid;
+    } catch { /* ignore */ }
+  }
+  next();
+}
+app.use(authMiddleware);
 
-/** -------- ROUTES: Health -------- */
+function objId(id) {
+  try { return new ObjectId(id); } catch { return null; }
+}
+
+// ---------- Health ----------
 app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
 app.get('/', (_req, res) => res.send('OK'));
 
-/** =========================================================
- *  A) NATIVE GOOGLE SIGN-IN (Android/iOS Dev Build)
- *  Client gets Google idToken natively, POSTs here to mint app JWT
- *  ========================================================= */
+// ============================================================
+// A) MOBILE/WEB AUTH (kept from your original)
+// ============================================================
 app.post('/auth/google/native', async (req, res) => {
   try {
     const { idToken } = req.body || {};
     if (!idToken) return res.status(400).json({ error: 'missing idToken' });
-
-    // Verify Google idToken (audience = your Web client ID)
     const ticket = await oauthVerify.verifyIdToken({
       idToken,
       audience: GOOGLE_WEB_CLIENT_ID,
@@ -150,7 +146,7 @@ app.post('/auth/google/native', async (req, res) => {
     if (!doc) return res.status(500).json({ error: 'user upsert failed' });
 
     const token = signSession(doc._id.toString());
-    const userPayload = { name: doc.name, email: doc.email, picture: doc.picture };
+    const userPayload = { name: doc.name, email: doc.email, picture: doc.picture, _id: doc._id };
     return res.json({ token, user: userPayload });
   } catch (e) {
     console.error('[NATIVE GOOGLE AUTH ERROR]', e);
@@ -158,17 +154,10 @@ app.post('/auth/google/native', async (req, res) => {
   }
 });
 
-/** =========================================================
- *  B) WEB POPUP FLOW (optional; keeps your web login working)
- *  /auth/google/start -> user consents -> /auth/callback
- *  ========================================================= */
 app.get('/auth/google/start', (req, res) => {
   if (!oauthWeb) return res.status(500).send('Server not configured for web OAuth flow');
   const scopes = [
-    'openid',
-    'email',
-    'profile',
-    // add calendar if you need it for web-based consent
+    'openid', 'email', 'profile',
     'https://www.googleapis.com/auth/calendar.readonly',
   ];
   const { app_redirect } = req.query;
@@ -183,22 +172,18 @@ app.get('/auth/google/start', (req, res) => {
     redirect_uri: REDIRECT_URI,
     ...(state ? { state } : {}),
   });
-
   res.redirect(url);
 });
 
 app.get('/auth/callback', async (req, res) => {
   try {
     if (!oauthWeb) return res.status(500).send('Server not configured for web OAuth flow');
-
     const { code, state } = req.query;
     if (!code) return res.status(400).send('Missing code');
 
-    // Exchange code -> tokens using the SAME redirect_uri
     const { tokens } = await oauthWeb.getToken({ code, redirect_uri: REDIRECT_URI });
     if (!tokens.id_token) return res.status(400).send('No id_token');
 
-    // Validate id_token and get profile
     const ticket = await oauthVerify.verifyIdToken({
       idToken: tokens.id_token,
       audience: GOOGLE_WEB_CLIENT_ID,
@@ -210,7 +195,6 @@ app.get('/auth/callback', async (req, res) => {
       email: p.email,
       name: p.name,
       picture: p.picture,
-      // keep access/refresh tokens if you want to call Google APIs on behalf of the user (web)
       refreshToken: tokens.refresh_token ?? undefined,
       accessToken: tokens.access_token ?? undefined,
       tokenExpiry: tokens.expiry_date ? new Date(tokens.expiry_date) : undefined,
@@ -227,9 +211,8 @@ app.get('/auth/callback', async (req, res) => {
     if (!doc) return res.status(500).send('User upsert failed');
 
     const token = signSession(doc._id.toString());
-    const userPayload = { name: doc.name, email: doc.email, picture: doc.picture };
+    const userPayload = { name: doc.name, email: doc.email, picture: doc.picture, _id: doc._id };
 
-    // If the web popup was opened from your SPA, postMessage back and close
     const targetOrigin = WEB_ORIGIN || '*';
     return res
       .set('Content-Type', 'text/html')
@@ -248,36 +231,34 @@ app.get('/auth/callback', async (req, res) => {
   }
 });
 
-/** -------- Protected: Me -------- */
+// ---------- Me / Profile ----------
 app.get('/me', async (req, res) => {
   if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
   const doc = await Users.findOne(
-    { _id: new ObjectId(req.userId) },
-    { projection: { name: 1, email: 1, picture: 1, profile: 1 } }
+    { _id: objId(req.userId) },
+    { projection: { name: 1, email: 1, picture: 1, profile: 1, voiceId: 1 } }
   );
   if (!doc) return res.status(404).json({ error: 'not found' });
   doc.profile = doc.profile || { ...EMPTY_PROFILE };
-  res.json({ _id: doc._id, name: doc.name, email: doc.email, picture: doc.picture, profile: doc.profile });
+  res.json({ _id: doc._id.toString(), name: doc.name, email: doc.email, picture: doc.picture, profile: doc.profile, voiceId: doc.voiceId });
 });
 
 app.put('/me', async (req, res) => {
   try {
     if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
-    const _id = new ObjectId(req.userId);
+    const _id = objId(req.userId);
     const profile = sanitizeProfile((req.body && req.body.profile) || {});
     const result = await Users.updateOne({ _id }, { $set: { profile, updatedAt: new Date() } });
     if (!result.acknowledged) return res.status(500).json({ error: 'update failed' });
 
-    const doc = await Users.findOne(
-      { _id },
-      { projection: { name: 1, email: 1, picture: 1, profile: 1 } }
-    );
+    const doc = await Users.findOne({ _id }, { projection: { name: 1, email: 1, picture: 1, profile: 1, voiceId: 1 } });
     res.json({
-      _id: doc._id,
+      _id: doc._id.toString(),
       name: doc.name,
       email: doc.email,
       picture: doc.picture,
       profile: doc.profile || { ...EMPTY_PROFILE },
+      voiceId: doc.voiceId,
     });
   } catch (e) {
     console.error('[PROFILE UPDATE ERROR]', e);
@@ -285,18 +266,261 @@ app.put('/me', async (req, res) => {
   }
 });
 
-/** -------- OPTIONAL: Calendar demo (works for WEB flow where tokens were saved) -------- */
+// Minimal public/basic info for persona (used by voice-agent)
+app.get('/users/:id/basic', async (req, res) => {
+  try {
+    const u = await Users.findOne(
+      { _id: objId(req.params.id) },
+      { projection: { name: 1, email: 1, voiceId: 1 } }
+    );
+    if (!u) return res.status(404).json({ error: 'not found' });
+    res.json({ _id: u._id.toString(), name: u.name, email: u.email, voiceId: u.voiceId || null });
+  } catch (e) {
+    res.status(500).json({ error: 'lookup failed' });
+  }
+});
+
+// ============================================================
+// B) Devices API (deviceId ↔ ownerId mapping + sharing)
+// ============================================================
+/*
+Devices doc shape:
+{
+  id: string,            // deviceId (app-generated)
+  ownerId: ObjectId,     // user who registered this device
+  label?: string,
+  platform?: 'ios'|'android'|'web',
+  model?: string,
+  sharing: boolean,      // app intent to share location
+  lastSeenAt?: Date,
+  createdAt: Date,
+  updatedAt: Date
+}
+*/
+
+app.get('/devices/:id', async (req, res) => {
+  try {
+    const dev = await Devices.findOne({ id: String(req.params.id) });
+    if (!dev) return res.status(404).json({ error: 'not found' });
+    res.json({
+      id: dev.id,
+      ownerId: dev.ownerId?.toString(),
+      label: dev.label || null,
+      platform: dev.platform || null,
+      model: dev.model || null,
+      sharing: !!dev.sharing,
+      lastSeenAt: dev.lastSeenAt || null,
+    });
+  } catch (e) {
+    res.status(500).json({ error: 'lookup failed' });
+  }
+});
+
+app.post('/devices/register', async (req, res) => {
+  try {
+    if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
+    const ownerId = objId(req.userId);
+    const { id, label, platform, model } = req.body || {};
+    if (!id || typeof id !== 'string') return res.status(400).json({ error: 'id required' });
+
+    const update = {
+      id,
+      ownerId,
+      label: typeof label === 'string' ? label.slice(0, 80) : undefined,
+      platform: typeof platform === 'string' ? platform : undefined,
+      model: typeof model === 'string' ? model.slice(0, 120) : undefined,
+      updatedAt: new Date(),
+      $setOnInsert: { createdAt: new Date(), sharing: false },
+    };
+
+    await Devices.updateOne({ id }, { $set: update, $setOnInsert: update.$setOnInsert }, { upsert: true });
+    const dev = await Devices.findOne({ id });
+    res.json({
+      id: dev.id,
+      ownerId: dev.ownerId?.toString(),
+      label: dev.label || null,
+      platform: dev.platform || null,
+      model: dev.model || null,
+      sharing: !!dev.sharing,
+      lastSeenAt: dev.lastSeenAt || null,
+    });
+  } catch (e) {
+    res.status(500).json({ error: 'register failed' });
+  }
+});
+
+app.post('/devices/:id/sharing', async (req, res) => {
+  try {
+    if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
+    const { sharing } = req.body || {};
+    const id = String(req.params.id);
+    const dev = await Devices.findOne({ id });
+    if (!dev) return res.status(404).json({ error: 'not found' });
+    if (dev.ownerId?.toString() !== req.userId) return res.status(403).json({ error: 'forbidden' });
+
+    await Devices.updateOne({ id }, { $set: { sharing: !!sharing, updatedAt: new Date() } });
+    const updated = await Devices.findOne({ id });
+    res.json({
+      id: updated.id,
+      ownerId: updated.ownerId?.toString(),
+      label: updated.label || null,
+      platform: updated.platform || null,
+      model: updated.model || null,
+      sharing: !!updated.sharing,
+      lastSeenAt: updated.lastSeenAt || null,
+    });
+  } catch (e) {
+    res.status(500).json({ error: 'update failed' });
+  }
+});
+
+app.post('/devices/:id/touch', async (req, res) => {
+  try {
+    const id = String(req.params.id);
+    const { lastSeenAt } = req.body || {};
+    await Devices.updateOne({ id }, { $set: { lastSeenAt: lastSeenAt ? new Date(lastSeenAt) : new Date() } });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'touch failed' });
+  }
+});
+
+// ============================================================
+// C) Lobby / Grants (invite, accept, revoke, list, ACL check)
+// ============================================================
+/*
+Grants doc:
+{
+  _id,
+  ownerId: ObjectId,  // persona owner
+  guestId: ObjectId,  // person who can access owner's persona
+  status: 'active' | 'revoked' | 'pending',
+  inviteCode?: string,  // simple 6-8 char
+  createdAt: Date,
+  updatedAt: Date
+}
+*/
+
+function code8() { return Math.random().toString(36).slice(2, 10).toUpperCase(); }
+
+app.get('/lobby/summary', async (req, res) => {
+  if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
+  const me = objId(req.userId);
+
+  const granted = await Grants.aggregate([
+    { $match: { ownerId: me, status: { $in: ['active', 'pending'] } } },
+    { $lookup: { from: 'users', localField: 'guestId', foreignField: '_id', as: 'guest' } },
+    { $addFields: { guest: { $first: '$guest' } } },
+    { $project: { status: 1, inviteCode: 1, createdAt: 1, updatedAt: 1, guest: { _id: 1, name: 1, email: 1, picture: 1 } } }
+  ]).toArray();
+
+  const received = await Grants.aggregate([
+    { $match: { guestId: me, status: 'active' } },
+    { $lookup: { from: 'users', localField: 'ownerId', foreignField: '_id', as: 'owner' } },
+    { $addFields: { owner: { $first: '$owner' } } },
+    { $project: { status: 1, createdAt: 1, updatedAt: 1, owner: { _id: 1, name: 1, email: 1, picture: 1 } } }
+  ]).toArray();
+
+  res.json({ granted, received });
+});
+
+app.post('/lobby/invite', async (req, res) => {
+  if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
+  const ownerId = objId(req.userId);
+  const { email } = req.body || {};
+  if (!email || typeof email !== 'string') return res.status(400).json({ error: 'email required' });
+
+  const guest = await Users.findOne({ email: email.toLowerCase() });
+  if (!guest) {
+    // You can also choose to create a placeholder and mark pending; for now, require account.
+    return res.status(404).json({ error: 'guest not found (user must sign up first)' });
+  }
+
+  // Upsert: if existing revoked/pending, reactivate or keep pending
+  const existing = await Grants.findOne({ ownerId, guestId: guest._id });
+  const code = code8();
+  if (existing) {
+    await Grants.updateOne(
+      { _id: existing._id },
+      { $set: { status: 'pending', inviteCode: code, updatedAt: new Date() } }
+    );
+    const g = await Grants.findOne({ _id: existing._id });
+    return res.json({ ok: true, grantId: g._id.toString(), status: g.status, inviteCode: g.inviteCode });
+  }
+
+  const ins = await Grants.insertOne({
+    ownerId,
+    guestId: guest._id,
+    status: 'pending',
+    inviteCode: code,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  });
+  return res.json({ ok: true, grantId: ins.insertedId.toString(), status: 'pending', inviteCode: code });
+});
+
+app.post('/lobby/accept', async (req, res) => {
+  if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
+  const guestId = objId(req.userId);
+  const { inviteCode } = req.body || {};
+  if (!inviteCode) return res.status(400).json({ error: 'inviteCode required' });
+
+  const g = await Grants.findOne({ inviteCode: String(inviteCode).toUpperCase(), guestId });
+  if (!g) return res.status(404).json({ error: 'no matching invite' });
+
+  await Grants.updateOne({ _id: g._id }, { $set: { status: 'active', inviteCode: null, updatedAt: new Date() } });
+  res.json({ ok: true });
+});
+
+app.post('/lobby/revoke', async (req, res) => {
+  if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
+  const ownerId = objId(req.userId);
+  const { grantId } = req.body || {};
+  if (!grantId) return res.status(400).json({ error: 'grantId required' });
+
+  const g = await Grants.findOne({ _id: objId(grantId) });
+  if (!g) return res.status(404).json({ error: 'not found' });
+  if (g.ownerId?.toString() !== ownerId.toString()) return res.status(403).json({ error: 'forbidden' });
+
+  await Grants.updateOne({ _id: g._id }, { $set: { status: 'revoked', updatedAt: new Date() } });
+  res.json({ ok: true });
+});
+
+// Simple ACL check used by voice-agent
+// GET /acl/can-act-as?target=<userId>
+app.get('/acl/can-act-as', async (req, res) => {
+  try {
+    if (!req.userId) return res.status(401).json({ allowed: false, reason: 'unauthorized' });
+    const me = req.userId;
+    const target = String(req.query.target || '').trim();
+    if (!target) return res.status(400).json({ allowed: false, reason: 'missing target' });
+    if (me === target) return res.json({ allowed: true, reason: 'self' });
+
+    const ok = await Grants.findOne({
+      ownerId: objId(target),
+      guestId: objId(me),
+      status: 'active',
+    });
+    if (ok) return res.json({ allowed: true, reason: 'grant' });
+    return res.status(403).json({ allowed: false, reason: 'no-grant' });
+  } catch (e) {
+    res.status(500).json({ allowed: false, reason: 'server' });
+  }
+});
+
+// ============================================================
+// D) Calendar demo (unchanged) — tokens stored for WEB flow only
+// ============================================================
 app.get('/calendar/next', async (req, res) => {
   try {
     if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
-    const user = await Users.findOne({ _id: new ObjectId(req.userId) });
+    const user = await Users.findOne({ _id: objId(req.userId) });
     if (!user) return res.status(404).json({ error: 'user not found' });
 
     if (!user.accessToken && !user.refreshToken) {
       return res.status(200).json({ message: 'No Google tokens stored for this account (use web OAuth flow to consent).' });
     }
 
-    // Use stored tokens to call Calendar
     const oa = new OAuth2Client({
       clientId: GOOGLE_WEB_CLIENT_ID,
       clientSecret: GOOGLE_WEB_CLIENT_SECRET,
@@ -333,10 +557,9 @@ app.get('/calendar/next', async (req, res) => {
   }
 });
 
-/** -------- Vercel / Local export -------- */
+// ---------- Vercel / Local export ----------
 if (!process.env.VERCEL) {
   const port = process.env.PORT || 4000;
   app.listen(port, () => console.log(`API on :${port}`));
 }
-
 export default app;
