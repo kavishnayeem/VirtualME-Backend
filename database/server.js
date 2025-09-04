@@ -403,26 +403,84 @@ Grants doc:
 
 function code8() { return Math.random().toString(36).slice(2, 10).toUpperCase(); }
 
+// ---- LOBBY SUMMARY (reads embedded users.lobby.*) -------------------------
 app.get('/lobby/summary', async (req, res) => {
-  if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
-  const me = objId(req.userId);
+  try {
+    if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
 
-  const granted = await Grants.aggregate([
-    { $match: { ownerId: me, status: { $in: ['active', 'pending'] } } },
-    { $lookup: { from: 'users', localField: 'guestId', foreignField: '_id', as: 'guest' } },
-    { $addFields: { guest: { $first: '$guest' } } },
-    { $project: { status: 1, inviteCode: 1, createdAt: 1, updatedAt: 1, guest: { _id: 1, name: 1, email: 1, picture: 1 } } }
-  ]).toArray();
+    const meId = new ObjectId(req.userId);
+    const meDoc = await Users.findOne(
+      { _id: meId },
+      { projection: { _id: 1, email: 1, name: 1, picture: 1, lobby: 1 } }
+    );
+    if (!meDoc) return res.status(404).json({ error: 'not_found' });
 
-  const received = await Grants.aggregate([
-    { $match: { guestId: me, status: 'active' } },
-    { $lookup: { from: 'users', localField: 'ownerId', foreignField: '_id', as: 'owner' } },
-    { $addFields: { owner: { $first: '$owner' } } },
-    { $project: { status: 1, createdAt: 1, updatedAt: 1, owner: { _id: 1, name: 1, email: 1, picture: 1 } } }
-  ]).toArray();
+    const me = {
+      _id: meDoc._id.toString(),
+      email: meDoc.email,
+      name: meDoc.name,
+      picture: meDoc.picture,
+    };
 
-  res.json({ granted, received });
+    // Normalize any Mongo export formats like {$date: {$numberLong: "..."}}
+    const toIso = (v) => {
+      if (!v) return undefined;
+      if (typeof v === 'string' || typeof v === 'number') return new Date(v).toISOString();
+      if (v.$date?.$numberLong) return new Date(Number(v.$date.$numberLong)).toISOString();
+      if (v.$date) return new Date(v.$date).toISOString();
+      return undefined;
+    };
+
+    // ---- Outbound: people I granted access to (from my embedded lobby.granted)
+    const granted = (meDoc.lobby?.granted ?? []).map((g) => ({
+      status: g.status || 'active',
+      inviteCode: g.inviteCode ?? null,
+      createdAt: toIso(g.createdAt),
+      updatedAt: toIso(g.lastUsedAt) || toIso(g.updatedAt),
+      id: g.id || g.grantId || undefined,
+      guest: {
+        _id: String(g?.guest?._id ?? ''),
+        email: g?.guest?.email || '',
+        name: g?.guest?.name || undefined,
+        picture: g?.guest?.picture || undefined,
+      },
+    }));
+
+    // ---- Inbound: people who granted ME access
+    // Find any user whose lobby.granted contains my _id as guest._id with status active
+    const myIdStr = meDoc._id.toString();
+    const owners = await Users.find(
+      { 'lobby.granted': { $elemMatch: { 'guest._id': myIdStr, status: 'active' } } },
+      { projection: { _id: 1, email: 1, name: 1, picture: 1, lobby: 1 } }
+    ).toArray();
+
+    const received = [];
+    for (const owner of owners) {
+      for (const g of owner.lobby?.granted ?? []) {
+        if (String(g?.guest?._id) === myIdStr && g.status === 'active') {
+          received.push({
+            status: 'active',
+            createdAt: toIso(g.createdAt),
+            updatedAt: toIso(g.lastUsedAt) || toIso(g.updatedAt),
+            id: g.id || g.grantId || undefined,
+            owner: {
+              _id: owner._id.toString(),
+              email: owner.email,
+              name: owner.name,
+              picture: owner.picture,
+            },
+          });
+        }
+      }
+    }
+
+    return res.json({ me, granted, received });
+  } catch (e) {
+    console.error('[LOBBY SUMMARY ERROR]', e);
+    return res.status(500).json({ error: 'server_error' });
+  }
 });
+
 
 app.post('/lobby/invite', async (req, res) => {
   if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
