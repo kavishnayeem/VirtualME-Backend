@@ -77,7 +77,6 @@ const EMPTY_PROFILE = Object.freeze({
   calendarPrefs: '',
   locationSharingOptIn: false,
 });
-
 function sanitizeProfile(raw) {
   const out = { ...EMPTY_PROFILE };
   if (typeof raw.character === 'string') out.character = raw.character.slice(0, 500);
@@ -92,11 +91,9 @@ function sanitizeProfile(raw) {
   if (typeof raw.locationSharingOptIn === 'boolean') out.locationSharingOptIn = raw.locationSharingOptIn;
   return out;
 }
-
 function signSession(userId) {
   return jwt.sign({ uid: userId }, JWT_SECRET, { expiresIn: '30d' });
 }
-
 async function authMiddleware(req, _res, next) {
   const token = req.headers.authorization?.replace('Bearer ', '') || req.cookies?.vm;
   if (token) {
@@ -118,7 +115,7 @@ app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
 app.get('/', (_req, res) => res.send('OK'));
 
 // ============================================================
-// A) MOBILE/WEB AUTH
+// A) MOBILE/WEB AUTH (kept from your original)
 // ============================================================
 app.post('/auth/google/native', async (req, res) => {
   try {
@@ -137,12 +134,11 @@ app.post('/auth/google/native', async (req, res) => {
       name: p.name,
       picture: p.picture,
       updatedAt: new Date(),
-      $setOnInsert: { createdAt: new Date(), profile: { ...EMPTY_PROFILE } },
     };
 
     await Users.updateOne(
       { googleId: p.sub },
-      { $set: update, $setOnInsert: update.$setOnInsert },
+      { $set: update, $setOnInsert: { createdAt: new Date(), profile: { ...EMPTY_PROFILE } } },
       { upsert: true }
     );
 
@@ -182,7 +178,7 @@ app.get('/auth/google/start', (req, res) => {
 app.get('/auth/callback', async (req, res) => {
   try {
     if (!oauthWeb) return res.status(500).send('Server not configured for web OAuth flow');
-    const { code } = req.query;
+    const { code, state } = req.query;
     if (!code) return res.status(400).send('Missing code');
 
     const { tokens } = await oauthWeb.getToken({ code, redirect_uri: REDIRECT_URI });
@@ -203,12 +199,11 @@ app.get('/auth/callback', async (req, res) => {
       accessToken: tokens.access_token ?? undefined,
       tokenExpiry: tokens.expiry_date ? new Date(tokens.expiry_date) : undefined,
       updatedAt: new Date(),
-      $setOnInsert: { createdAt: new Date(), profile: { ...EMPTY_PROFILE } },
     };
 
     await Users.updateOne(
       { googleId: p.sub },
-      { $set: update, $setOnInsert: update.$setOnInsert },
+      { $set: update, $setOnInsert: { createdAt: new Date(), profile: { ...EMPTY_PROFILE } } },
       { upsert: true }
     );
 
@@ -245,14 +240,7 @@ app.get('/me', async (req, res) => {
   );
   if (!doc) return res.status(404).json({ error: 'not found' });
   doc.profile = doc.profile || { ...EMPTY_PROFILE };
-  res.json({
-    _id: doc._id.toString(),
-    name: doc.name,
-    email: doc.email,
-    picture: doc.picture,
-    profile: doc.profile,
-    voiceId: doc.voiceId
-  });
+  res.json({ _id: doc._id.toString(), name: doc.name, email: doc.email, picture: doc.picture, profile: doc.profile, voiceId: doc.voiceId });
 });
 
 app.put('/me', async (req, res) => {
@@ -413,10 +401,11 @@ Grants doc:
 }
 */
 
+function code8() { return Math.random().toString(36).slice(2, 10).toUpperCase(); }
 const genInviteCode = () =>
   `INV-${Math.random().toString(36).slice(2, 6).toUpperCase()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
 
-// ---- SUMMARY (reads embedded users.lobby.* and scans inbound) -------------
+
 app.get('/lobby/summary', async (req, res) => {
   try {
     if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
@@ -673,6 +662,7 @@ app.post('/lobby/revoke', async (req, res) => {
     return res.status(500).json({ error: 'server_error' });
   }
 });
+
 
 // Simple ACL check used by voice-agent
 // GET /acl/can-act-as?target=<userId>
