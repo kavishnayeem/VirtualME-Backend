@@ -403,7 +403,7 @@ Grants doc:
 
 function code8() { return Math.random().toString(36).slice(2, 10).toUpperCase(); }
 
-// ---- LOBBY SUMMARY (reads embedded users.lobby.*) -------------------------
+
 app.get('/lobby/summary', async (req, res) => {
   try {
     if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
@@ -422,7 +422,6 @@ app.get('/lobby/summary', async (req, res) => {
       picture: meDoc.picture,
     };
 
-    // Normalize any Mongo export formats like {$date: {$numberLong: "..."}}
     const toIso = (v) => {
       if (!v) return undefined;
       if (typeof v === 'string' || typeof v === 'number') return new Date(v).toISOString();
@@ -431,8 +430,8 @@ app.get('/lobby/summary', async (req, res) => {
       return undefined;
     };
 
-    // ---- Outbound: people I granted access to (from my embedded lobby.granted)
-    const granted = (meDoc.lobby?.granted ?? []).map((g) => ({
+    // Outbound ACTIVE grants from my embedded lobby.granted
+    const activeGrants = (meDoc.lobby?.granted ?? []).map((g) => ({
       status: g.status || 'active',
       inviteCode: g.inviteCode ?? null,
       createdAt: toIso(g.createdAt),
@@ -446,8 +445,24 @@ app.get('/lobby/summary', async (req, res) => {
       },
     }));
 
-    // ---- Inbound: people who granted ME access
-    // Find any user whose lobby.granted contains my _id as guest._id with status active
+    // Convert my embedded lobby.invites[] -> "pending grants" so FE sees them
+    const pendingAsGrants = (meDoc.lobby?.invites ?? []).map((inv) => ({
+      status: 'pending',
+      inviteCode: inv.inviteCode || undefined,
+      createdAt: toIso(inv.createdAt),
+      updatedAt: toIso(inv.updatedAt),
+      id: undefined,
+      guest: {
+        _id: '',
+        email: inv.email || '',
+        name: undefined,
+        picture: undefined,
+      },
+    }));
+
+    const granted = [...activeGrants, ...pendingAsGrants];
+
+    // Inbound: owners who granted ME access (scan others’ lobby.granted for my _id)
     const myIdStr = meDoc._id.toString();
     const owners = await Users.find(
       { 'lobby.granted': { $elemMatch: { 'guest._id': myIdStr, status: 'active' } } },
@@ -482,67 +497,175 @@ app.get('/lobby/summary', async (req, res) => {
 });
 
 
+
+const genInviteCode = () =>
+  `INV-${Math.random().toString(36).slice(2, 6).toUpperCase()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+
+// ---- INVITE: owner invites a guest by email -------------------------------
 app.post('/lobby/invite', async (req, res) => {
-  if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
-  const ownerId = objId(req.userId);
-  const { email } = req.body || {};
-  if (!email || typeof email !== 'string') return res.status(400).json({ error: 'email required' });
+  try {
+    if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
+    const { email } = req.body || {};
+    if (!email || typeof email !== 'string') return res.status(400).json({ error: 'invalid_email' });
 
-  const guest = await Users.findOne({ email: email.toLowerCase() });
-  if (!guest) {
-    // You can also choose to create a placeholder and mark pending; for now, require account.
-    return res.status(404).json({ error: 'guest not found (user must sign up first)' });
-  }
+    const ownerId = new ObjectId(req.userId);
+    const normEmail = email.toLowerCase().trim();
+    const now = new Date();
+    const inviteCode = genInviteCode();
 
-  // Upsert: if existing revoked/pending, reactivate or keep pending
-  const existing = await Grants.findOne({ ownerId, guestId: guest._id });
-  const code = code8();
-  if (existing) {
-    await Grants.updateOne(
-      { _id: existing._id },
-      { $set: { status: 'pending', inviteCode: code, updatedAt: new Date() } }
+    // Remove any existing pending invite for same email
+    await Users.updateOne(
+      { _id: ownerId },
+      { $pull: { 'lobby.invites': { email: normEmail, status: 'pending' } } }
     );
-    const g = await Grants.findOne({ _id: existing._id });
-    return res.json({ ok: true, grantId: g._id.toString(), status: g.status, inviteCode: g.inviteCode });
+
+    // Push new invite
+    await Users.updateOne(
+      { _id: ownerId },
+      {
+        $push: {
+          'lobby.invites': {
+            email: normEmail,
+            inviteCode,
+            status: 'pending',
+            createdAt: now
+          }
+        }
+      }
+    );
+
+    // OPTIONAL: if the guest already has an account, mirror into Grants as pending
+    const guest = await Users.findOne({ email: normEmail }, { projection: { _id: 1 } });
+    if (guest) {
+      const existing = await Grants.findOne({ ownerId, guestId: guest._id });
+      if (existing) {
+        await Grants.updateOne(
+          { _id: existing._id },
+          { $set: { status: 'pending', inviteCode, updatedAt: now } }
+        );
+      } else {
+        await Grants.insertOne({
+          ownerId,
+          guestId: guest._id,
+          status: 'pending',
+          inviteCode,
+          createdAt: now,
+          updatedAt: now
+        });
+      }
+    }
+
+    return res.json({ ok: true, inviteCode });
+  } catch (e) {
+    console.error('[INVITE ERROR]', e);
+    return res.status(500).json({ error: 'server_error' });
   }
-
-  const ins = await Grants.insertOne({
-    ownerId,
-    guestId: guest._id,
-    status: 'pending',
-    inviteCode: code,
-    createdAt: new Date(),
-    updatedAt: new Date(),
-  });
-  return res.json({ ok: true, grantId: ins.insertedId.toString(), status: 'pending', inviteCode: code });
 });
 
+// ---- ACCEPT: guest accepts an invite using inviteCode ---------------------
 app.post('/lobby/accept', async (req, res) => {
-  if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
-  const guestId = objId(req.userId);
-  const { inviteCode } = req.body || {};
-  if (!inviteCode) return res.status(400).json({ error: 'inviteCode required' });
+  try {
+    if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
+    const { inviteCode } = req.body || {};
+    if (!inviteCode || typeof inviteCode !== 'string') return res.status(400).json({ error: 'invalid_code' });
 
-  const g = await Grants.findOne({ inviteCode: String(inviteCode).toUpperCase(), guestId });
-  if (!g) return res.status(404).json({ error: 'no matching invite' });
+    const guest = await Users.findOne(
+      { _id: new ObjectId(req.userId) },
+      { projection: { _id: 1, email: 1, name: 1, picture: 1 } }
+    );
+    if (!guest) return res.status(404).json({ error: 'guest_not_found' });
 
-  await Grants.updateOne({ _id: g._id }, { $set: { status: 'active', inviteCode: null, updatedAt: new Date() } });
-  res.json({ ok: true });
+    // Find owner with a matching pending invite
+    const owner = await Users.findOne(
+      { 'lobby.invites': { $elemMatch: { inviteCode, status: 'pending' } } },
+      { projection: { _id: 1, email: 1, name: 1, picture: 1, lobby: 1 } }
+    );
+    if (!owner) return res.status(404).json({ error: 'invite_not_found' });
+
+    // Remove invite
+    await Users.updateOne(
+      { _id: owner._id },
+      { $pull: { 'lobby.invites': { inviteCode } } }
+    );
+
+    // Add active grant to owner's lobby.granted
+    const grantId = `grant_${owner._id}_${guest._id}_${Date.now()}`;
+    const now = new Date();
+    await Users.updateOne(
+      { _id: owner._id },
+      {
+        $push: {
+          'lobby.granted': {
+            id: grantId,
+            status: 'active',
+            createdAt: now,
+            updatedAt: now,
+            guest: {
+              _id: guest._id.toString(),
+              email: guest.email,
+              name: guest.name,
+              picture: guest.picture,
+            },
+          },
+        },
+      }
+    );
+
+    // OPTIONAL: sync Grants collection if a doc exists
+    await Grants.updateOne(
+      { ownerId: owner._id, guestId: guest._id },
+      { $set: { status: 'active', inviteCode: null, updatedAt: now } }
+    );
+
+    return res.json({ ok: true, grantId });
+  } catch (e) {
+    console.error('[ACCEPT ERROR]', e);
+    return res.status(500).json({ error: 'server_error' });
+  }
 });
 
+// ---- REVOKE: owner revokes a pending invite OR an active grant ------------
 app.post('/lobby/revoke', async (req, res) => {
-  if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
-  const ownerId = objId(req.userId);
-  const { grantId } = req.body || {};
-  if (!grantId) return res.status(400).json({ error: 'grantId required' });
+  try {
+    if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
+    const ownerId = new ObjectId(req.userId);
+    const { inviteCode, grantId } = req.body || {};
 
-  const g = await Grants.findOne({ _id: objId(grantId) });
-  if (!g) return res.status(404).json({ error: 'not found' });
-  if (g.ownerId?.toString() !== ownerId.toString()) return res.status(403).json({ error: 'forbidden' });
+    if (inviteCode) {
+      // remove pending invite from embedded structure
+      const r = await Users.updateOne(
+        { _id: ownerId },
+        { $pull: { 'lobby.invites': { inviteCode } } }
+      );
+      // also clear any pending grant mirror
+      await Grants.updateOne(
+        { ownerId, inviteCode },
+        { $set: { status: 'revoked', updatedAt: new Date() } }
+      );
+      return res.json({ ok: true, removed: r.modifiedCount });
+    }
 
-  await Grants.updateOne({ _id: g._id }, { $set: { status: 'revoked', updatedAt: new Date() } });
-  res.json({ ok: true });
+    if (grantId) {
+      // hard remove from embedded granted list
+      const r = await Users.updateOne(
+        { _id: ownerId },
+        { $pull: { 'lobby.granted': { $or: [ { id: grantId }, { grantId } ] } } }
+      );
+      // optionally mark Grants doc revoked too
+      await Grants.updateOne(
+        { ownerId, _id: { $exists: true } }, // best effort
+        { $set: { status: 'revoked', updatedAt: new Date() } }
+      );
+      return res.json({ ok: true, updated: r.modifiedCount });
+    }
+
+    return res.status(400).json({ error: 'missing_inviteCode_or_grantId' });
+  } catch (e) {
+    console.error('[REVOKE ERROR]', e);
+    return res.status(500).json({ error: 'server_error' });
+  }
 });
+
 
 // Simple ACL check used by voice-agent
 // GET /acl/can-act-as?target=<userId>
