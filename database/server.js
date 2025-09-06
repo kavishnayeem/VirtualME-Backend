@@ -1,7 +1,3 @@
-// server.js (database/auth)
-// Deploy: https://virtual-me-auth.vercel.app
-// ESM module. Node 18+. MongoDB official driver.
-
 import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
@@ -97,34 +93,27 @@ function signSession(userId) {
 async function authMiddleware(req, _res, next) {
   const token = req.headers.authorization?.replace('Bearer ', '') || req.cookies?.vm;
   if (token) {
-    try {
-      const payload = jwt.verify(token, JWT_SECRET);
-      req.userId = payload.uid;
-    } catch { /* ignore */ }
+    try { const payload = jwt.verify(token, JWT_SECRET); req.userId = payload.uid; }
+    catch { /* ignore */ }
   }
   next();
 }
 app.use(authMiddleware);
 
-function objId(id) {
-  try { return new ObjectId(id); } catch { return null; }
-}
+function objId(id) { try { return new ObjectId(id); } catch { return null; } }
 
 // ---------- Health ----------
 app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
 app.get('/', (_req, res) => res.send('OK'));
 
 // ============================================================
-// A) MOBILE/WEB AUTH (kept from your original)
+// A) MOBILE/WEB AUTH
 // ============================================================
 app.post('/auth/google/native', async (req, res) => {
   try {
     const { idToken } = req.body || {};
     if (!idToken) return res.status(400).json({ error: 'missing idToken' });
-    const ticket = await oauthVerify.verifyIdToken({
-      idToken,
-      audience: GOOGLE_WEB_CLIENT_ID,
-    });
+    const ticket = await oauthVerify.verifyIdToken({ idToken, audience: GOOGLE_WEB_CLIENT_ID });
     const p = ticket.getPayload();
     if (!p?.sub) return res.status(400).json({ error: 'invalid idToken' });
 
@@ -178,16 +167,13 @@ app.get('/auth/google/start', (req, res) => {
 app.get('/auth/callback', async (req, res) => {
   try {
     if (!oauthWeb) return res.status(500).send('Server not configured for web OAuth flow');
-    const { code, state } = req.query;
+    const { code } = req.query;
     if (!code) return res.status(400).send('Missing code');
 
     const { tokens } = await oauthWeb.getToken({ code, redirect_uri: REDIRECT_URI });
     if (!tokens.id_token) return res.status(400).send('No id_token');
 
-    const ticket = await oauthVerify.verifyIdToken({
-      idToken: tokens.id_token,
-      audience: GOOGLE_WEB_CLIENT_ID,
-    });
+    const ticket = await oauthVerify.verifyIdToken({ idToken: tokens.id_token, audience: GOOGLE_WEB_CLIENT_ID });
     const p = ticket.getPayload();
 
     const update = {
@@ -266,7 +252,6 @@ app.put('/me', async (req, res) => {
   }
 });
 
-// Minimal public/basic info for persona (used by voice-agent)
 app.get('/users/:id/basic', async (req, res) => {
   try {
     const u = await Users.findOne(
@@ -281,131 +266,18 @@ app.get('/users/:id/basic', async (req, res) => {
 });
 
 // ============================================================
-// B) Devices API (deviceId ↔ ownerId mapping + sharing)
+// B) Devices API (unchanged – keep your current endpoints)
 // ============================================================
-/*
-Devices doc shape:
-{
-  id: string,            // deviceId (app-generated)
-  ownerId: ObjectId,     // user who registered this device
-  label?: string,
-  platform?: 'ios'|'android'|'web',
-  model?: string,
-  sharing: boolean,      // app intent to share location
-  lastSeenAt?: Date,
-  createdAt: Date,
-  updatedAt: Date
+// ...
+
+// ============================================================
+// C) Lobby / Grants (invite, accept, reject, revoke, list, requests, ACL)
+// ============================================================
+function genInviteCode() {
+  return `INV-${Math.random().toString(36).slice(2, 6).toUpperCase()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
 }
-*/
 
-app.get('/devices/:id', async (req, res) => {
-  try {
-    const dev = await Devices.findOne({ id: String(req.params.id) });
-    if (!dev) return res.status(404).json({ error: 'not found' });
-    res.json({
-      id: dev.id,
-      ownerId: dev.ownerId?.toString(),
-      label: dev.label || null,
-      platform: dev.platform || null,
-      model: dev.model || null,
-      sharing: !!dev.sharing,
-      lastSeenAt: dev.lastSeenAt || null,
-    });
-  } catch (e) {
-    res.status(500).json({ error: 'lookup failed' });
-  }
-});
-
-app.post('/devices/register', async (req, res) => {
-  try {
-    if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
-    const ownerId = objId(req.userId);
-    const { id, label, platform, model } = req.body || {};
-    if (!id || typeof id !== 'string') return res.status(400).json({ error: 'id required' });
-
-    const update = {
-      id,
-      ownerId,
-      label: typeof label === 'string' ? label.slice(0, 80) : undefined,
-      platform: typeof platform === 'string' ? platform : undefined,
-      model: typeof model === 'string' ? model.slice(0, 120) : undefined,
-      updatedAt: new Date(),
-      $setOnInsert: { createdAt: new Date(), sharing: false },
-    };
-
-    await Devices.updateOne({ id }, { $set: update, $setOnInsert: update.$setOnInsert }, { upsert: true });
-    const dev = await Devices.findOne({ id });
-    res.json({
-      id: dev.id,
-      ownerId: dev.ownerId?.toString(),
-      label: dev.label || null,
-      platform: dev.platform || null,
-      model: dev.model || null,
-      sharing: !!dev.sharing,
-      lastSeenAt: dev.lastSeenAt || null,
-    });
-  } catch (e) {
-    res.status(500).json({ error: 'register failed' });
-  }
-});
-
-app.post('/devices/:id/sharing', async (req, res) => {
-  try {
-    if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
-    const { sharing } = req.body || {};
-    const id = String(req.params.id);
-    const dev = await Devices.findOne({ id });
-    if (!dev) return res.status(404).json({ error: 'not found' });
-    if (dev.ownerId?.toString() !== req.userId) return res.status(403).json({ error: 'forbidden' });
-
-    await Devices.updateOne({ id }, { $set: { sharing: !!sharing, updatedAt: new Date() } });
-    const updated = await Devices.findOne({ id });
-    res.json({
-      id: updated.id,
-      ownerId: updated.ownerId?.toString(),
-      label: updated.label || null,
-      platform: updated.platform || null,
-      model: updated.model || null,
-      sharing: !!updated.sharing,
-      lastSeenAt: updated.lastSeenAt || null,
-    });
-  } catch (e) {
-    res.status(500).json({ error: 'update failed' });
-  }
-});
-
-app.post('/devices/:id/touch', async (req, res) => {
-  try {
-    const id = String(req.params.id);
-    const { lastSeenAt } = req.body || {};
-    await Devices.updateOne({ id }, { $set: { lastSeenAt: lastSeenAt ? new Date(lastSeenAt) : new Date() } });
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ error: 'touch failed' });
-  }
-});
-
-// ============================================================
-// C) Lobby / Grants (invite, accept, revoke, list, ACL check)
-// ============================================================
-/*
-Grants doc:
-{
-  _id,
-  ownerId: ObjectId,  // persona owner
-  guestId: ObjectId,  // person who can access owner's persona
-  status: 'active' | 'revoked' | 'pending',
-  inviteCode?: string,  // simple 6-8 char
-  createdAt: Date,
-  updatedAt: Date
-}
-*/
-
-function code8() { return Math.random().toString(36).slice(2, 10).toUpperCase(); }
-const genInviteCode = () =>
-  `INV-${Math.random().toString(36).slice(2, 6).toUpperCase()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
-
-
+// Summary: granted (outbound active + outbound pending) and received (active)
 app.get('/lobby/summary', async (req, res) => {
   try {
     if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
@@ -417,54 +289,36 @@ app.get('/lobby/summary', async (req, res) => {
     );
     if (!meDoc) return res.status(404).json({ error: 'not_found' });
 
-    const me = {
-      _id: meDoc._id.toString(),
-      email: meDoc.email,
-      name: meDoc.name,
-      picture: meDoc.picture,
-    };
+    const toIso = (v) => (v ? new Date(v).toISOString() : undefined);
 
-    const toIso = (v) => {
-      if (!v) return undefined;
-      if (typeof v === 'string' || typeof v === 'number') return new Date(v).toISOString();
-      if (v.$date?.$numberLong) return new Date(Number(v.$date.$numberLong)).toISOString();
-      if (v.$date) return new Date(v.$date).toISOString();
-      return undefined;
-    };
-
-    // Outbound: active grants stored in my embedded lobby.granted
     const activeGrants = (meDoc.lobby?.granted ?? []).map((g) => ({
       status: g.status || 'active',
       inviteCode: g.inviteCode ?? null,
       createdAt: toIso(g.createdAt),
-      updatedAt: toIso(g.lastUsedAt) || toIso(g.updatedAt),
-      id: g.id || g.grantId || undefined,
+      updatedAt: toIso(g.updatedAt || g.lastUsedAt),
+      id: g.id || g.grantId,
       guest: {
         _id: String(g?.guest?._id ?? ''),
         email: g?.guest?.email || '',
-        name: g?.guest?.name || undefined,
-        picture: g?.guest?.picture || undefined,
+        name: g?.guest?.name,
+        picture: g?.guest?.picture,
       },
-    }));
+    })).filter(Boolean);
 
-    // Pending invites from my embedded lobby.invites[] (as pseudo-grants)
-    const pendingAsGrants = (meDoc.lobby?.invites ?? []).map((inv) => ({
-      status: 'pending',
-      inviteCode: inv.inviteCode || undefined,
-      createdAt: toIso(inv.createdAt),
-      updatedAt: toIso(inv.updatedAt),
-      id: undefined,
-      guest: {
-        _id: '',
-        email: inv.email || '',
-        name: undefined,
-        picture: undefined,
-      },
-    }));
+    const pendingAsGrants = (meDoc.lobby?.invites ?? [])
+      .filter((i) => i?.status === 'pending')
+      .map((inv) => ({
+        status: 'pending',
+        inviteCode: inv.inviteCode,
+        createdAt: toIso(inv.createdAt),
+        updatedAt: toIso(inv.updatedAt),
+        id: undefined,
+        guest: { _id: '', email: inv.email || '', name: undefined, picture: undefined },
+      }));
 
     const granted = [...activeGrants, ...pendingAsGrants];
 
-    // Inbound: owners who granted ME access (scan others’ lobby.granted for my _id)
+    // Received ACTIVE grants (other owners who granted ME access)
     const myIdStr = meDoc._id.toString();
     const owners = await Users.find(
       { 'lobby.granted': { $elemMatch: { 'guest._id': myIdStr, status: 'active' } } },
@@ -478,8 +332,8 @@ app.get('/lobby/summary', async (req, res) => {
           received.push({
             status: 'active',
             createdAt: toIso(g.createdAt),
-            updatedAt: toIso(g.lastUsedAt) || toIso(g.updatedAt),
-            id: g.id || g.grantId || undefined,
+            updatedAt: toIso(g.updatedAt || g.lastUsedAt),
+            id: g.id || g.grantId,
             owner: {
               _id: owner._id.toString(),
               email: owner.email,
@@ -491,14 +345,50 @@ app.get('/lobby/summary', async (req, res) => {
       }
     }
 
-    return res.json({ me, granted, received });
+    return res.json({
+      me: { _id: meDoc._id.toString(), email: meDoc.email, name: meDoc.name, picture: meDoc.picture },
+      granted,
+      received,
+    });
   } catch (e) {
     console.error('[LOBBY SUMMARY ERROR]', e);
     return res.status(500).json({ error: 'server_error' });
   }
 });
 
-// ---- INVITE: owner invites a guest by email -------------------------------
+// INCOMING invite requests (pending invites that target my email)
+app.get('/lobby/requests', async (req, res) => {
+  try {
+    if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
+    const me = await Users.findOne({ _id: objId(req.userId) }, { projection: { _id: 1, email: 1 } });
+    if (!me) return res.status(404).json({ error: 'not_found' });
+
+    const cursor = Users.find(
+      { 'lobby.invites': { $elemMatch: { email: me.email.toLowerCase(), status: 'pending' } } },
+      { projection: { _id: 1, name: 1, email: 1, picture: 1, lobby: 1 } }
+    );
+
+    const items = [];
+    for await (const owner of cursor) {
+      for (const inv of owner.lobby?.invites ?? []) {
+        if (inv?.status === 'pending' && inv?.email?.toLowerCase() === me.email.toLowerCase()) {
+          items.push({
+            inviteCode: inv.inviteCode,
+            createdAt: inv.createdAt ? new Date(inv.createdAt).toISOString() : undefined,
+            owner: { _id: owner._id.toString(), name: owner.name, email: owner.email, picture: owner.picture },
+          });
+        }
+      }
+    }
+
+    res.json({ requests: items });
+  } catch (e) {
+    console.error('[LOBBY REQUESTS ERROR]', e);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+// Invite (owner -> guest email)
 app.post('/lobby/invite', async (req, res) => {
   try {
     if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
@@ -525,13 +415,13 @@ app.post('/lobby/invite', async (req, res) => {
             email: normEmail,
             inviteCode,
             status: 'pending',
-            createdAt: now
-          }
-        }
+            createdAt: now,
+          },
+        },
       }
     );
 
-    // OPTIONAL: if the guest already has an account, mirror into Grants as pending
+    // Mirror into Grants if guest exists
     const guest = await Users.findOne({ email: normEmail }, { projection: { _id: 1 } });
     if (guest) {
       const existing = await Grants.findOne({ ownerId, guestId: guest._id });
@@ -547,7 +437,7 @@ app.post('/lobby/invite', async (req, res) => {
           status: 'pending',
           inviteCode,
           createdAt: now,
-          updatedAt: now
+          updatedAt: now,
         });
       }
     }
@@ -559,7 +449,7 @@ app.post('/lobby/invite', async (req, res) => {
   }
 });
 
-// ---- ACCEPT: guest accepts an invite using inviteCode ---------------------
+// Accept (guest -> inviteCode)
 app.post('/lobby/accept', async (req, res) => {
   try {
     if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
@@ -608,10 +498,11 @@ app.post('/lobby/accept', async (req, res) => {
       }
     );
 
-    // OPTIONAL: sync Grants collection if a doc exists
+    // Sync Grants collection
     await Grants.updateOne(
       { ownerId: owner._id, guestId: guest._id },
-      { $set: { status: 'active', inviteCode: null, updatedAt: now } }
+      { $set: { status: 'active', inviteCode: null, updatedAt: now } },
+      { upsert: true }
     );
 
     return res.json({ ok: true, grantId });
@@ -621,7 +512,36 @@ app.post('/lobby/accept', async (req, res) => {
   }
 });
 
-// ---- REVOKE: owner revokes a pending invite OR an active grant ------------
+// Reject (guest rejects an incoming invite by inviteCode)
+app.post('/lobby/reject', async (req, res) => {
+  try {
+    if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
+    const { inviteCode } = req.body || {};
+    if (!inviteCode) return res.status(400).json({ error: 'invalid_code' });
+
+    const owner = await Users.findOne(
+      { 'lobby.invites': { $elemMatch: { inviteCode, status: 'pending' } } },
+      { projection: { _id: 1 } }
+    );
+    if (!owner) return res.status(404).json({ error: 'invite_not_found' });
+
+    await Users.updateOne(
+      { _id: owner._id },
+      { $pull: { 'lobby.invites': { inviteCode } } }
+    );
+    await Grants.updateMany(
+      { ownerId: owner._id, status: 'pending', inviteCode },
+      { $set: { status: 'revoked', updatedAt: new Date() } }
+    );
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('[REJECT ERROR]', e);
+    return res.status(500).json({ error: 'server_error' });
+  }
+});
+
+// Revoke (owner revokes a pending invite OR an active grant)
 app.post('/lobby/revoke', async (req, res) => {
   try {
     if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
@@ -629,12 +549,10 @@ app.post('/lobby/revoke', async (req, res) => {
     const { inviteCode, grantId } = req.body || {};
 
     if (inviteCode) {
-      // remove pending invite from embedded structure
       const r = await Users.updateOne(
         { _id: ownerId },
         { $pull: { 'lobby.invites': { inviteCode } } }
       );
-      // also clear any pending grant mirror
       await Grants.updateMany(
         { ownerId, inviteCode },
         { $set: { status: 'revoked', updatedAt: new Date() } }
@@ -643,12 +561,10 @@ app.post('/lobby/revoke', async (req, res) => {
     }
 
     if (grantId) {
-      // remove from embedded granted list
       const r = await Users.updateOne(
         { _id: ownerId },
         { $pull: { 'lobby.granted': { $or: [ { id: grantId }, { grantId } ] } } }
       );
-      // mark any Grants doc revoked (best-effort)
       await Grants.updateMany(
         { ownerId, status: 'active' },
         { $set: { status: 'revoked', updatedAt: new Date() } }
@@ -663,6 +579,28 @@ app.post('/lobby/revoke', async (req, res) => {
   }
 });
 
+// Revoke by guestId (lets UI pass guest._id)
+app.post('/lobby/revoke-by-guest', async (req, res) => {
+  try {
+    if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
+    const ownerId = objId(req.userId);
+    const { guestId } = req.body || {};
+    if (!guestId) return res.status(400).json({ error: 'missing_guestId' });
+
+    const r = await Users.updateOne(
+      { _id: ownerId },
+      { $pull: { 'lobby.granted': { 'guest._id': String(guestId) } } }
+    );
+    await Grants.updateMany(
+      { ownerId, guestId: objId(guestId) },
+      { $set: { status: 'revoked', updatedAt: new Date() } }
+    );
+    return res.json({ ok: true, updated: r.modifiedCount });
+  } catch (e) {
+    console.error('[REVOKE BY GUEST ERROR]', e);
+    return res.status(500).json({ error: 'server_error' });
+  }
+});
 
 // Simple ACL check used by voice-agent
 // GET /acl/can-act-as?target=<userId>
@@ -683,55 +621,6 @@ app.get('/acl/can-act-as', async (req, res) => {
     return res.status(403).json({ allowed: false, reason: 'no-grant' });
   } catch (e) {
     res.status(500).json({ allowed: false, reason: 'server' });
-  }
-});
-
-// ============================================================
-// D) Calendar demo (unchanged) — tokens stored for WEB flow only
-// ============================================================
-app.get('/calendar/next', async (req, res) => {
-  try {
-    if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
-    const user = await Users.findOne({ _id: objId(req.userId) });
-    if (!user) return res.status(404).json({ error: 'user not found' });
-
-    if (!user.accessToken && !user.refreshToken) {
-      return res.status(200).json({ message: 'No Google tokens stored for this account (use web OAuth flow to consent).' });
-    }
-
-    const oa = new OAuth2Client({
-      clientId: GOOGLE_WEB_CLIENT_ID,
-      clientSecret: GOOGLE_WEB_CLIENT_SECRET,
-      redirectUri: REDIRECT_URI,
-    });
-    oa.setCredentials({
-      access_token: user.accessToken,
-      refresh_token: user.refreshToken,
-    });
-
-    const calendar = google.calendar({ version: 'v3', auth: oa });
-    const now = new Date().toISOString();
-    const resp = await calendar.events.list({
-      calendarId: 'primary',
-      timeMin: now,
-      singleEvents: true,
-      orderBy: 'startTime',
-      maxResults: 1,
-    });
-
-    const item = resp.data.items?.[0];
-    if (!item) return res.json({ message: 'No upcoming events' });
-
-    res.json({
-      id: item.id,
-      summary: item.summary,
-      start: item.start?.dateTime || item.start?.date,
-      end: item.end?.dateTime || item.end?.date,
-      location: item.location,
-    });
-  } catch (e) {
-    console.error('[CALENDAR ERROR]', e);
-    res.status(500).json({ error: 'calendar query failed' });
   }
 });
 
