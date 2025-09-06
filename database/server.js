@@ -357,36 +357,92 @@ app.get('/lobby/summary', async (req, res) => {
 });
 
 // INCOMING invite requests (pending invites that target my email)
+// --- replace your current /lobby/requests handler with this ---
 app.get('/lobby/requests', async (req, res) => {
   try {
     if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
-    const me = await Users.findOne({ _id: objId(req.userId) }, { projection: { _id: 1, email: 1 } });
+    const me = await Users.findOne(
+      { _id: objId(req.userId) },
+      { projection: { _id: 1, email: 1 } }
+    );
     if (!me) return res.status(404).json({ error: 'not_found' });
 
-    const cursor = Users.find(
-      { 'lobby.invites': { $elemMatch: { email: me.email.toLowerCase(), status: 'pending' } } },
+    const meEmail = (me.email || '').toLowerCase();
+
+    // A) Gather pending requests from Users.lobby.invites
+    const ownerCursor = Users.find(
+      { 'lobby.invites': { $elemMatch: { email: meEmail, status: 'pending' } } },
       { projection: { _id: 1, name: 1, email: 1, picture: 1, lobby: 1 } }
     );
 
-    const items = [];
-    for await (const owner of cursor) {
-      for (const inv of owner.lobby?.invites ?? []) {
-        if (inv?.status === 'pending' && inv?.email?.toLowerCase() === me.email.toLowerCase()) {
-          items.push({
-            inviteCode: inv.inviteCode,
+    const byKey = new Map(); // key: inviteCode || `${ownerId}:${meEmail}`
+
+    for await (const owner of ownerCursor) {
+      const invites = Array.isArray(owner.lobby?.invites) ? owner.lobby.invites : [];
+      for (const inv of invites) {
+        if ((inv?.status === 'pending') && (inv?.email?.toLowerCase() === meEmail)) {
+          const key = inv.inviteCode || `${owner._id.toString()}:${meEmail}`;
+          byKey.set(key, {
+            inviteCode: inv.inviteCode || null,
             createdAt: inv.createdAt ? new Date(inv.createdAt).toISOString() : undefined,
-            owner: { _id: owner._id.toString(), name: owner.name, email: owner.email, picture: owner.picture },
+            owner: {
+              _id: owner._id.toString(),
+              name: owner.name,
+              email: owner.email,
+              picture: owner.picture,
+            },
           });
         }
       }
     }
 
-    res.json({ requests: items });
+    // B) Gather pending requests from Grants (guestId=me, status=pending)
+    const grantPend = await Grants
+      .find({ guestId: me._id, status: 'pending' }, { projection: { ownerId: 1, inviteCode: 1, createdAt: 1 } })
+      .toArray();
+
+    // Fetch owner fields for unique ownerIds in grants
+    const ownerIds = [...new Set(grantPend.map(g => g.ownerId).filter(Boolean))];
+    const owners = ownerIds.length
+      ? await Users.find(
+          { _id: { $in: ownerIds } },
+          { projection: { _id: 1, name: 1, email: 1, picture: 1 } }
+        ).toArray()
+      : [];
+    const ownerMap = new Map(owners.map(o => [o._id.toString(), o]));
+
+    for (const g of grantPend) {
+      const owner = ownerMap.get(g.ownerId.toString());
+      if (!owner) continue;
+      const key = g.inviteCode || `${owner._id.toString()}:${meEmail}`;
+      if (!byKey.has(key)) {
+        byKey.set(key, {
+          inviteCode: g.inviteCode || null,
+          createdAt: g.createdAt ? new Date(g.createdAt).toISOString() : undefined,
+          owner: {
+            _id: owner._id.toString(),
+            name: owner.name,
+            email: owner.email,
+            picture: owner.picture,
+          },
+        });
+      }
+    }
+
+    // optional: sort newest first
+    const requests = Array.from(byKey.values()).sort((a, b) => {
+      const ta = a.createdAt ? Date.parse(a.createdAt) : 0;
+      const tb = b.createdAt ? Date.parse(b.createdAt) : 0;
+      return tb - ta;
+    });
+
+    return res.json({ requests });
   } catch (e) {
     console.error('[LOBBY REQUESTS ERROR]', e);
-    res.status(500).json({ error: 'server_error' });
+    return res.status(500).json({ error: 'server_error' });
   }
 });
+
 
 // Invite (owner -> guest email)
 app.post('/lobby/invite', async (req, res) => {
@@ -449,7 +505,8 @@ app.post('/lobby/invite', async (req, res) => {
   }
 });
 
-// Accept (guest -> inviteCode)
+
+// --- modify your /lobby/accept handler: add the GRANTS fallback block ---
 app.post('/lobby/accept', async (req, res) => {
   try {
     if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
@@ -457,27 +514,38 @@ app.post('/lobby/accept', async (req, res) => {
     if (!inviteCode || typeof inviteCode !== 'string') return res.status(400).json({ error: 'invalid_code' });
 
     const guest = await Users.findOne(
-      { _id: new ObjectId(req.userId) },
+      { _id: objId(req.userId) },
       { projection: { _id: 1, email: 1, name: 1, picture: 1 } }
     );
     if (!guest) return res.status(404).json({ error: 'guest_not_found' });
 
-    // Find owner with a matching pending invite
-    const owner = await Users.findOne(
+    // A) Try to resolve by Users.lobby.invites first
+    let owner = await Users.findOne(
       { 'lobby.invites': { $elemMatch: { inviteCode, status: 'pending' } } },
       { projection: { _id: 1, email: 1, name: 1, picture: 1, lobby: 1 } }
     );
-    if (!owner) return res.status(404).json({ error: 'invite_not_found' });
 
-    // Remove invite
+    // B) If not found, resolve via Grants (guestId=me, inviteCode pending)
+    if (!owner) {
+      const grant = await Grants.findOne({ guestId: guest._id, inviteCode, status: 'pending' });
+      if (!grant) return res.status(404).json({ error: 'invite_not_found' });
+      owner = await Users.findOne(
+        { _id: grant.ownerId },
+        { projection: { _id: 1, email: 1, name: 1, picture: 1, lobby: 1 } }
+      );
+      if (!owner) return res.status(404).json({ error: 'owner_not_found' });
+    }
+
+    // Remove invite if it exists on owner doc
     await Users.updateOne(
       { _id: owner._id },
       { $pull: { 'lobby.invites': { inviteCode } } }
     );
 
-    // Add active grant to owner's lobby.granted
+    // Promote to active grant
     const grantId = `grant_${owner._id}_${guest._id}_${Date.now()}`;
     const now = new Date();
+
     await Users.updateOne(
       { _id: owner._id },
       {
@@ -498,7 +566,6 @@ app.post('/lobby/accept', async (req, res) => {
       }
     );
 
-    // Sync Grants collection
     await Grants.updateOne(
       { ownerId: owner._id, guestId: guest._id },
       { $set: { status: 'active', inviteCode: null, updatedAt: now } },
@@ -512,26 +579,46 @@ app.post('/lobby/accept', async (req, res) => {
   }
 });
 
+
 // Reject (guest rejects an incoming invite by inviteCode)
+// --- modify your /lobby/reject handler similarly ---
 app.post('/lobby/reject', async (req, res) => {
   try {
     if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
     const { inviteCode } = req.body || {};
     if (!inviteCode) return res.status(400).json({ error: 'invalid_code' });
 
-    const owner = await Users.findOne(
+    // Try owner doc first
+    let owner = await Users.findOne(
       { 'lobby.invites': { $elemMatch: { inviteCode, status: 'pending' } } },
       { projection: { _id: 1 } }
     );
-    if (!owner) return res.status(404).json({ error: 'invite_not_found' });
 
-    await Users.updateOne(
-      { _id: owner._id },
-      { $pull: { 'lobby.invites': { inviteCode } } }
-    );
-    await Grants.updateMany(
-      { ownerId: owner._id, status: 'pending', inviteCode },
+    if (owner) {
+      await Users.updateOne(
+        { _id: owner._id },
+        { $pull: { 'lobby.invites': { inviteCode } } }
+      );
+      await Grants.updateMany(
+        { ownerId: owner._id, status: 'pending', inviteCode },
+        { $set: { status: 'revoked', updatedAt: new Date() } }
+      );
+      return res.json({ ok: true });
+    }
+
+    // Fallback via Grants
+    const meId = objId(req.userId);
+    const pendGrant = await Grants.findOne({ guestId: meId, inviteCode, status: 'pending' });
+    if (!pendGrant) return res.status(404).json({ error: 'invite_not_found' });
+
+    await Grants.updateOne(
+      { _id: pendGrant._id },
       { $set: { status: 'revoked', updatedAt: new Date() } }
+    );
+    // Attempt to remove any stale embedded invite as well
+    await Users.updateOne(
+      { _id: pendGrant.ownerId },
+      { $pull: { 'lobby.invites': { inviteCode } } }
     );
 
     return res.json({ ok: true });
@@ -540,6 +627,7 @@ app.post('/lobby/reject', async (req, res) => {
     return res.status(500).json({ error: 'server_error' });
   }
 });
+
 
 // Revoke (owner revokes a pending invite OR an active grant)
 app.post('/lobby/revoke', async (req, res) => {
