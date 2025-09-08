@@ -398,36 +398,39 @@ app.get('/lobby/requests', async (req, res) => {
 
     // B) Gather pending requests from Grants (guestId=me, status=pending)
     const grantPend = await Grants
-      .find({ guestId: me._id, status: 'pending' }, { projection: { ownerId: 1, inviteCode: 1, createdAt: 1 } })
-      .toArray();
-
-    // Fetch owner fields for unique ownerIds in grants
-    const ownerIds = [...new Set(grantPend.map(g => g.ownerId).filter(Boolean))];
-    const owners = ownerIds.length
-      ? await Users.find(
-          { _id: { $in: ownerIds } },
-          { projection: { _id: 1, name: 1, email: 1, picture: 1 } }
-        ).toArray()
-      : [];
-    const ownerMap = new Map(owners.map(o => [o._id.toString(), o]));
-
-    for (const g of grantPend) {
-      const owner = ownerMap.get(g.ownerId.toString());
-      if (!owner) continue;
-      const key = g.inviteCode || `${owner._id.toString()}:${meEmail}`;
-      if (!byKey.has(key)) {
-        byKey.set(key, {
-          inviteCode: g.inviteCode || null,
-          createdAt: g.createdAt ? new Date(g.createdAt).toISOString() : undefined,
-          owner: {
-            _id: owner._id.toString(),
-            name: owner.name,
-            email: owner.email,
-            picture: owner.picture,
-          },
-        });
-      }
+    .find({ guestId: me._id, status: 'pending' }, { projection: { ownerId: 1, inviteCode: 1, createdAt: 1 } })
+    .toArray();
+  
+  const ownerIds = [...new Set(grantPend.map(g => g.ownerId).filter(Boolean))];
+  const owners = ownerIds.length
+    ? await Users.find(
+        { _id: { $in: ownerIds } },
+        { projection: { _id: 1, name: 1, email: 1, picture: 1 } }
+      ).toArray()
+    : [];
+  const ownerMap = new Map(owners.map(o => [o._id.toString(), o]));
+  
+  for (const g of grantPend) {
+    const owner = ownerMap.get(g.ownerId.toString());
+    if (!owner) continue;
+  
+    // ⬇️ synthesize a deterministic code when Grants row lacks inviteCode
+    const synthetic = `GRANT-${owner._id.toString()}-${me._id.toString()}`;
+    const code = g.inviteCode || synthetic;
+  
+    if (!byKey.has(code)) {
+      byKey.set(code, {
+        inviteCode: code, // <— always defined now
+        createdAt: g.createdAt ? new Date(g.createdAt).toISOString() : undefined,
+        owner: {
+          _id: owner._id.toString(),
+          name: owner.name,
+          email: owner.email,
+          picture: owner.picture,
+        },
+      });
     }
+  }
 
     // optional: sort newest first
     const requests = Array.from(byKey.values()).sort((a, b) => {
@@ -518,23 +521,33 @@ app.post('/lobby/accept', async (req, res) => {
       { projection: { _id: 1, email: 1, name: 1, picture: 1 } }
     );
     if (!guest) return res.status(404).json({ error: 'guest_not_found' });
-
-    // A) Try to resolve by Users.lobby.invites first
+    
+    // Try owner via embedded invite first (existing code)...
     let owner = await Users.findOne(
       { 'lobby.invites': { $elemMatch: { inviteCode, status: 'pending' } } },
       { projection: { _id: 1, email: 1, name: 1, picture: 1, lobby: 1 } }
     );
+    
 
     // B) If not found, resolve via Grants (guestId=me, inviteCode pending)
-    if (!owner) {
-      const grant = await Grants.findOne({ guestId: guest._id, inviteCode, status: 'pending' });
-      if (!grant) return res.status(404).json({ error: 'invite_not_found' });
-      owner = await Users.findOne(
-        { _id: grant.ownerId },
-        { projection: { _id: 1, email: 1, name: 1, picture: 1, lobby: 1 } }
-      );
-      if (!owner) return res.status(404).json({ error: 'owner_not_found' });
+    if (!owner && inviteCode.startsWith('GRANT-')) {
+      const parts = inviteCode.split('-'); // ["GRANT", "<ownerId>", "<guestId>"]
+      if (parts.length === 3) {
+        const ownerId = objId(parts[1]);
+        const guestId = objId(parts[2]);
+        if (ownerId && guestId && guestId.equals(guest._id)) {
+          const pend = await Grants.findOne({ ownerId, guestId, status: 'pending' });
+          if (pend) {
+            owner = await Users.findOne(
+              { _id: ownerId },
+              { projection: { _id: 1, email: 1, name: 1, picture: 1, lobby: 1 } }
+            );
+          }
+        }
+      }
     }
+    
+    if (!owner) return res.status(404).json({ error: 'invite_not_found' });
 
     // Remove invite if it exists on owner doc
     await Users.updateOne(
