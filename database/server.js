@@ -169,12 +169,16 @@ app.get('/auth/google/start', (req, res) => {
 // - Otherwise, we postMessage back to the opener window for web popup flow
 // Update this section in your backend /auth/callback endpoint
 
+// Replace your entire /auth/callback endpoint with this:
+
 app.get('/auth/callback', async (req, res) => {
   try {
     if (!oauthWeb) return res.status(500).send('Server not configured for web OAuth flow');
 
     const { code, state } = req.query;
     if (!code) return res.status(400).send('Missing code');
+
+    console.log('[CALLBACK] Received code, state:', { code: code.slice(0, 10) + '...', state });
 
     // Exchange the auth code for tokens
     const { tokens } = await oauthWeb.getToken({ code, redirect_uri: REDIRECT_URI });
@@ -218,41 +222,64 @@ app.get('/auth/callback', async (req, res) => {
       try {
         const s = JSON.parse(Buffer.from(String(state), 'base64url').toString('utf8'));
         app_redirect = s?.app_redirect;
-      } catch {
-        /* ignore malformed state */
+        console.log('[CALLBACK] Parsed app_redirect from state:', app_redirect);
+      } catch (e) {
+        console.error('[CALLBACK] Failed to parse state:', e);
       }
     }
 
     if (app_redirect) {
       const b64 = Buffer.from(JSON.stringify({ token, user: userPayload })).toString('base64');
       
-      // IMPORTANT FIX: Handle Expo proxy URLs differently
-      // Expo proxy URLs need special handling for query parameters
-      if (app_redirect.includes('expo-auth-session')) {
-        // For Expo Go proxy URLs, we need to append properly
-        const separator = app_redirect.includes('#') ? '&' : '#';
-        const redirectUrl = `${app_redirect}${separator}vm=${encodeURIComponent(b64)}`;
+      // CRITICAL FIX FOR EXPO GO:
+      // Expo auth proxy expects the response in the URL fragment (after #)
+      // not in query parameters
+      if (app_redirect.includes('auth.expo.io') || app_redirect.includes('expo-auth-session')) {
+        // For Expo proxy, we must use JavaScript redirect with fragment
+        const redirectUrl = `${app_redirect}#vm=${encodeURIComponent(b64)}`;
         
         console.log('[CALLBACK] Expo Go redirect to:', redirectUrl);
         
-        // Send HTML that auto-redirects (more reliable for Expo Go)
+        // This HTML/JS redirect is more reliable for Expo Go
         return res.send(`
           <!DOCTYPE html>
           <html>
           <head>
             <meta charset="utf-8" />
-            <meta http-equiv="refresh" content="0;url=${redirectUrl}">
+            <title>Redirecting...</title>
           </head>
           <body>
-            <script>window.location.href = '${redirectUrl}';</script>
-            <p>Redirecting...</p>
+            <p>Authentication successful! Redirecting back to app...</p>
+            <script>
+              // Try multiple redirect methods for better compatibility
+              const targetUrl = ${JSON.stringify(redirectUrl)};
+              
+              // Method 1: location.replace (doesn't add to history)
+              try {
+                window.location.replace(targetUrl);
+              } catch (e) {
+                // Method 2: location.href (fallback)
+                window.location.href = targetUrl;
+              }
+              
+              // Method 3: If still here after 100ms, try assignment
+              setTimeout(() => {
+                window.location = targetUrl;
+              }, 100);
+            </script>
+            <noscript>
+              <meta http-equiv="refresh" content="0;url=${redirectUrl}">
+              <p>If you are not redirected, <a href="${redirectUrl}">click here</a>.</p>
+            </noscript>
           </body>
           </html>
         `);
       } else {
         // Standard deep link for standalone apps
         const sep = app_redirect.includes('?') ? '&' : '?';
-        return res.redirect(`${app_redirect}${sep}vm=${encodeURIComponent(b64)}`);
+        const redirectUrl = `${app_redirect}${sep}vm=${encodeURIComponent(b64)}`;
+        console.log('[CALLBACK] Standard redirect to:', redirectUrl);
+        return res.redirect(redirectUrl);
       }
     }
 
@@ -268,10 +295,10 @@ app.get('/auth/callback', async (req, res) => {
    window.close();
  })();
 </script>
-<p>You can close this window.</p>`);
+<p>Authentication successful! You can close this window.</p>`);
   } catch (e) {
     console.error('[OAUTH CALLBACK ERROR]', e);
-    return res.status(500).send('OAuth callback failed');
+    return res.status(500).send('OAuth callback failed: ' + e.message);
   }
 });
 
