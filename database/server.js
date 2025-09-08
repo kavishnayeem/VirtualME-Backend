@@ -165,12 +165,10 @@ app.get('/auth/google/start', (req, res) => {
 });
 
 // OAuth web callback: exchanges `code` -> tokens -> user upsert -> session
-// - If `state` includes { app_redirect }, we deep-link back to the mobile app with ?vm=<base64 payload>
-// - Otherwise, we postMessage back to the opener window for web popup flow
-// Update this section in your backend /auth/callback endpoint
-
-// Replace your entire /auth/callback endpoint with this:
-
+// - If `state` includes { app_redirect }, we deep-link back to the app
+//   * Expo proxy: return payload in URL fragment (#vm=...)
+//   * Native deep link: return payload in query (?vm=...)
+// - Otherwise, postMessage back to web popup
 app.get('/auth/callback', async (req, res) => {
   try {
     if (!oauthWeb) return res.status(500).send('Server not configured for web OAuth flow');
@@ -178,20 +176,20 @@ app.get('/auth/callback', async (req, res) => {
     const { code, state } = req.query;
     if (!code) return res.status(400).send('Missing code');
 
-    console.log('[CALLBACK] Received code, state:', { code: code.slice(0, 10) + '...', state });
+    console.log('[CALLBACK] Received code, state:', { code: String(code).slice(0, 10) + '...', state });
 
-    // Exchange the auth code for tokens
+    // Exchange auth code for tokens
     const { tokens } = await oauthWeb.getToken({ code, redirect_uri: REDIRECT_URI });
     if (!tokens.id_token) return res.status(400).send('No id_token');
 
-    // Verify id_token and extract Google profile
+    // Verify ID token (Google profile)
     const ticket = await oauthVerify.verifyIdToken({
       idToken: tokens.id_token,
       audience: GOOGLE_WEB_CLIENT_ID,
     });
     const p = ticket.getPayload();
 
-    // Upsert the user in Mongo
+    // Upsert user
     const update = {
       googleId: p.sub,
       email: p.email,
@@ -212,11 +210,11 @@ app.get('/auth/callback', async (req, res) => {
     const doc = await Users.findOne({ googleId: p.sub });
     if (!doc) return res.status(500).send('User upsert failed');
 
-    // Create our app session token
+    // Create app session
     const token = signSession(doc._id.toString());
     const userPayload = { name: doc.name, email: doc.email, picture: doc.picture, _id: doc._id };
 
-    // Parse state for app_redirect
+    // Parse optional mobile deep-link from state
     let app_redirect;
     if (state) {
       try {
@@ -230,60 +228,37 @@ app.get('/auth/callback', async (req, res) => {
 
     if (app_redirect) {
       const b64 = Buffer.from(JSON.stringify({ token, user: userPayload })).toString('base64');
-      
-      // CRITICAL FIX FOR EXPO GO:
-      // Expo auth proxy expects the response in the URL fragment (after #)
-      // not in query parameters
-      if (app_redirect.includes('auth.expo.io') || app_redirect.includes('expo-auth-session')) {
-        // For Expo proxy, we must use JavaScript redirect with fragment
+
+      // Detect Expo AuthSession proxy (supports .dev and .io)
+      const isExpoProxy = /https:\/\/auth\.expo\.(dev|io)\//i.test(app_redirect);
+
+      if (isExpoProxy) {
+        // Expo proxy expects fragment (#vm=...), not query
         const redirectUrl = `${app_redirect}#vm=${encodeURIComponent(b64)}`;
-        
-        console.log('[CALLBACK] Expo Go redirect to:', redirectUrl);
-        
-        // This HTML/JS redirect is more reliable for Expo Go
-        return res.send(`
-          <!DOCTYPE html>
-          <html>
-          <head>
-            <meta charset="utf-8" />
-            <title>Redirecting...</title>
-          </head>
-          <body>
-            <p>Authentication successful! Redirecting back to app...</p>
-            <script>
-              // Try multiple redirect methods for better compatibility
-              const targetUrl = ${JSON.stringify(redirectUrl)};
-              
-              // Method 1: location.replace (doesn't add to history)
-              try {
-                window.location.replace(targetUrl);
-              } catch (e) {
-                // Method 2: location.href (fallback)
-                window.location.href = targetUrl;
-              }
-              
-              // Method 3: If still here after 100ms, try assignment
-              setTimeout(() => {
-                window.location = targetUrl;
-              }, 100);
-            </script>
-            <noscript>
-              <meta http-equiv="refresh" content="0;url=${redirectUrl}">
-              <p>If you are not redirected, <a href="${redirectUrl}">click here</a>.</p>
-            </noscript>
-          </body>
-          </html>
-        `);
+        console.log('[CALLBACK] Expo proxy redirect ->', redirectUrl);
+
+        return res
+          .set('Content-Type', 'text/html')
+          .send(`<!doctype html><meta charset="utf-8" />
+<title>Redirecting…</title>
+<p>Authentication successful! Redirecting back to the app…</p>
+<script>
+  (function(u){
+    try { window.location.replace(u); } catch(e) { try { window.location.href = u; } catch(_){} }
+    setTimeout(function(){ window.location = u; }, 100);
+  })(${JSON.stringify(redirectUrl)});
+</script>
+<noscript><meta http-equiv="refresh" content="0;url=${redirectUrl}"></noscript>`);
       } else {
-        // Standard deep link for standalone apps
+        // Native/dev-client deep link: use query (?vm=)
         const sep = app_redirect.includes('?') ? '&' : '?';
         const redirectUrl = `${app_redirect}${sep}vm=${encodeURIComponent(b64)}`;
-        console.log('[CALLBACK] Standard redirect to:', redirectUrl);
+        console.log('[CALLBACK] Native redirect ->', redirectUrl);
         return res.redirect(redirectUrl);
       }
     }
 
-    // Web fallback: postMessage back to opener window
+    // Web popup fallback (postMessage back to opener)
     const targetOrigin = WEB_ORIGIN || '*';
     return res
       .set('Content-Type', 'text/html')
@@ -295,12 +270,14 @@ app.get('/auth/callback', async (req, res) => {
    window.close();
  })();
 </script>
-<p>Authentication successful! You can close this window.</p>`);
+<p>Authentication successful. You can close this window.</p>`);
   } catch (e) {
     console.error('[OAUTH CALLBACK ERROR]', e);
-    return res.status(500).send('OAuth callback failed: ' + e.message);
+    return res.status(500).send('OAuth callback failed: ' + (e && e.message || 'unknown'));
   }
 });
+
+
 
 // ---------- Me / Profile ----------
 app.get('/me', async (req, res) => {
