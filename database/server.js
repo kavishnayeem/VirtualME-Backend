@@ -164,18 +164,28 @@ app.get('/auth/google/start', (req, res) => {
   res.redirect(url);
 });
 
+// OAuth web callback: exchanges `code` -> tokens -> user upsert -> session
+// - If `state` includes { app_redirect }, we deep-link back to the mobile app with ?vm=<base64 payload>
+// - Otherwise, we postMessage back to the opener window for web popup flow
 app.get('/auth/callback', async (req, res) => {
   try {
     if (!oauthWeb) return res.status(500).send('Server not configured for web OAuth flow');
-    const { code } = req.query;
+
+    const { code, state } = req.query;
     if (!code) return res.status(400).send('Missing code');
 
+    // Exchange the auth code for tokens
     const { tokens } = await oauthWeb.getToken({ code, redirect_uri: REDIRECT_URI });
     if (!tokens.id_token) return res.status(400).send('No id_token');
 
-    const ticket = await oauthVerify.verifyIdToken({ idToken: tokens.id_token, audience: GOOGLE_WEB_CLIENT_ID });
+    // Verify id_token and extract Google profile
+    const ticket = await oauthVerify.verifyIdToken({
+      idToken: tokens.id_token,
+      audience: GOOGLE_WEB_CLIENT_ID,
+    });
     const p = ticket.getPayload();
 
+    // Upsert the user in Mongo
     const update = {
       googleId: p.sub,
       email: p.email,
@@ -196,9 +206,28 @@ app.get('/auth/callback', async (req, res) => {
     const doc = await Users.findOne({ googleId: p.sub });
     if (!doc) return res.status(500).send('User upsert failed');
 
+    // Create our app session token
     const token = signSession(doc._id.toString());
     const userPayload = { name: doc.name, email: doc.email, picture: doc.picture, _id: doc._id };
 
+    // If mobile initiated with ?app_redirect=..., deep-link back into the app with a compact payload
+    let app_redirect;
+    if (state) {
+      try {
+        const s = JSON.parse(Buffer.from(String(state), 'base64url').toString('utf8'));
+        app_redirect = s?.app_redirect;
+      } catch {
+        /* ignore malformed state */
+      }
+    }
+
+    if (app_redirect) {
+      // Pack as base64 to keep URL short/safe
+      const b64 = Buffer.from(JSON.stringify({ token, user: userPayload })).toString('base64');
+      return res.redirect(`${app_redirect}?vm=${encodeURIComponent(b64)}`);
+    }
+
+    // Web fallback: postMessage back to opener window (popup flow)
     const targetOrigin = WEB_ORIGIN || '*';
     return res
       .set('Content-Type', 'text/html')
@@ -213,7 +242,7 @@ app.get('/auth/callback', async (req, res) => {
 <p>You can close this window.</p>`);
   } catch (e) {
     console.error('[OAUTH CALLBACK ERROR]', e);
-    res.status(500).send('OAuth callback failed');
+    return res.status(500).send('OAuth callback failed');
   }
 });
 
