@@ -167,6 +167,8 @@ app.get('/auth/google/start', (req, res) => {
 // OAuth web callback: exchanges `code` -> tokens -> user upsert -> session
 // - If `state` includes { app_redirect }, we deep-link back to the mobile app with ?vm=<base64 payload>
 // - Otherwise, we postMessage back to the opener window for web popup flow
+// Update this section in your backend /auth/callback endpoint
+
 app.get('/auth/callback', async (req, res) => {
   try {
     if (!oauthWeb) return res.status(500).send('Server not configured for web OAuth flow');
@@ -210,7 +212,7 @@ app.get('/auth/callback', async (req, res) => {
     const token = signSession(doc._id.toString());
     const userPayload = { name: doc.name, email: doc.email, picture: doc.picture, _id: doc._id };
 
-    // If mobile initiated with ?app_redirect=..., deep-link back into the app with a compact payload
+    // Parse state for app_redirect
     let app_redirect;
     if (state) {
       try {
@@ -223,11 +225,38 @@ app.get('/auth/callback', async (req, res) => {
 
     if (app_redirect) {
       const b64 = Buffer.from(JSON.stringify({ token, user: userPayload })).toString('base64');
-      const sep = app_redirect.includes('?') ? '&' : '?';    // <-- choose ? or &
-      return res.redirect(`${app_redirect}${sep}vm=${encodeURIComponent(b64)}`);
+      
+      // IMPORTANT FIX: Handle Expo proxy URLs differently
+      // Expo proxy URLs need special handling for query parameters
+      if (app_redirect.includes('expo-auth-session')) {
+        // For Expo Go proxy URLs, we need to append properly
+        const separator = app_redirect.includes('#') ? '&' : '#';
+        const redirectUrl = `${app_redirect}${separator}vm=${encodeURIComponent(b64)}`;
+        
+        console.log('[CALLBACK] Expo Go redirect to:', redirectUrl);
+        
+        // Send HTML that auto-redirects (more reliable for Expo Go)
+        return res.send(`
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <meta charset="utf-8" />
+            <meta http-equiv="refresh" content="0;url=${redirectUrl}">
+          </head>
+          <body>
+            <script>window.location.href = '${redirectUrl}';</script>
+            <p>Redirecting...</p>
+          </body>
+          </html>
+        `);
+      } else {
+        // Standard deep link for standalone apps
+        const sep = app_redirect.includes('?') ? '&' : '?';
+        return res.redirect(`${app_redirect}${sep}vm=${encodeURIComponent(b64)}`);
+      }
     }
-    console.log('[CALLBACK] app_redirect=', app_redirect);
-    // Web fallback: postMessage back to opener window (popup flow)
+
+    // Web fallback: postMessage back to opener window
     const targetOrigin = WEB_ORIGIN || '*';
     return res
       .set('Content-Type', 'text/html')
