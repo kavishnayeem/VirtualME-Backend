@@ -222,11 +222,11 @@ app.get('/auth/callback', async (req, res) => {
     }
 
     if (app_redirect) {
-      // Pack as base64 to keep URL short/safe
       const b64 = Buffer.from(JSON.stringify({ token, user: userPayload })).toString('base64');
-      return res.redirect(`${app_redirect}?vm=${encodeURIComponent(b64)}`);
+      const sep = app_redirect.includes('?') ? '&' : '?';    // <-- choose ? or &
+      return res.redirect(`${app_redirect}${sep}vm=${encodeURIComponent(b64)}`);
     }
-
+    console.log('[CALLBACK] app_redirect=', app_redirect);
     // Web fallback: postMessage back to opener window (popup flow)
     const targetOrigin = WEB_ORIGIN || '*';
     return res
