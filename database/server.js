@@ -14,6 +14,7 @@ const {
   MONGODB_DB,
   JWT_SECRET,
   GOOGLE_WEB_CLIENT_ID,
+  GOOGLE_ANDROID_CLIENT_ID,
   GOOGLE_WEB_CLIENT_SECRET,
   PUBLIC_BASE_URL,
   WEB_ORIGIN = '*',
@@ -109,12 +110,17 @@ app.get('/', (_req, res) => res.send('OK'));
 // ============================================================
 // A) MOBILE/WEB AUTH
 // ============================================================
+// server.js (excerpt)
+
 app.post('/auth/google/native', async (req, res) => {
   try {
-    console.log(req.body);
     const { idToken } = req.body || {};
     if (!idToken) return res.status(400).json({ error: 'missing idToken' });
-    const ticket = await oauthVerify.verifyIdToken({ idToken, audience: GOOGLE_WEB_CLIENT_ID });
+
+    const ticket = await oauthVerify.verifyIdToken({
+      idToken,
+      audience: process.env.GOOGLE_ANDROID_CLIENT_ID, // the Web client ID
+    });
     const p = ticket.getPayload();
     if (!p?.sub) return res.status(400).json({ error: 'invalid idToken' });
 
@@ -135,14 +141,16 @@ app.post('/auth/google/native', async (req, res) => {
     const doc = await Users.findOne({ googleId: p.sub });
     if (!doc) return res.status(500).json({ error: 'user upsert failed' });
 
-    const token = signSession(doc._id.toString());
+    const token = signSession(doc._id.toString()); // your JWT
     const userPayload = { name: doc.name, email: doc.email, picture: doc.picture, _id: doc._id };
+
     return res.json({ token, user: userPayload });
   } catch (e) {
     console.error('[NATIVE GOOGLE AUTH ERROR]', e);
     return res.status(500).json({ error: 'native auth failed' });
   }
 });
+
 
 app.get('/auth/google/start', (req, res) => {
   if (!oauthWeb) return res.status(500).send('Server not configured for web OAuth flow');
