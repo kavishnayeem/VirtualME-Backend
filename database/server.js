@@ -164,11 +164,8 @@ app.get('/auth/google/start', (req, res) => {
   res.redirect(url);
 });
 
-// OAuth web callback: exchanges `code` -> tokens -> user upsert -> session
-// - If `state` includes { app_redirect }, we deep-link back to the app
-//   * Expo proxy: return payload in URL fragment (#vm=...)
-//   * Native deep link: return payload in query (?vm=...)
-// - Otherwise, postMessage back to web popup
+
+// /auth/callback  (JS)
 app.get('/auth/callback', async (req, res) => {
   try {
     if (!oauthWeb) return res.status(500).send('Server not configured for web OAuth flow');
@@ -176,13 +173,11 @@ app.get('/auth/callback', async (req, res) => {
     const { code, state } = req.query;
     if (!code) return res.status(400).send('Missing code');
 
-    console.log('[CALLBACK] Received code, state:', { code: String(code).slice(0, 10) + '...', state });
-
-    // Exchange auth code for tokens
+    // Exchange code -> tokens
     const { tokens } = await oauthWeb.getToken({ code, redirect_uri: REDIRECT_URI });
     if (!tokens.id_token) return res.status(400).send('No id_token');
 
-    // Verify ID token (Google profile)
+    // Verify id_token
     const ticket = await oauthVerify.verifyIdToken({
       idToken: tokens.id_token,
       audience: GOOGLE_WEB_CLIENT_ID,
@@ -203,62 +198,95 @@ app.get('/auth/callback', async (req, res) => {
 
     await Users.updateOne(
       { googleId: p.sub },
-      { $set: update, $setOnInsert: { createdAt: new Date(), profile: { ...EMPTY_PROFILE } } },
+      {
+        $set: update,
+        $setOnInsert: {
+          createdAt: new Date(),
+          // make sure shape exists for new users
+          profile: {
+            character: '',
+            homeAddress: '',
+            usualPlaces: [],
+            languages: [],
+            timeZone: '',
+            availability: '',
+            voiceStyle: '',
+            aiPersona: '',
+            calendarPrefs: '',
+            locationSharingOptIn: false,
+          },
+          lobby: { granted: [], invites: [] },
+        },
+      },
       { upsert: true }
     );
 
     const doc = await Users.findOne({ googleId: p.sub });
     if (!doc) return res.status(500).send('User upsert failed');
 
-    // Create app session
+    // backfill if missing
+    const patch = {};
+    if (!doc.profile) patch.profile = {
+      character: '',
+      homeAddress: '',
+      usualPlaces: [],
+      languages: [],
+      timeZone: '',
+      availability: '',
+      voiceStyle: '',
+      aiPersona: '',
+      calendarPrefs: '',
+      locationSharingOptIn: false,
+    };
+    if (!doc.lobby) patch.lobby = { granted: [], invites: [] };
+    if (Object.keys(patch).length) {
+      await Users.updateOne({ _id: doc._id }, { $set: patch });
+      Object.assign(doc, patch);
+    }
+
+    // Create app session token
     const token = signSession(doc._id.toString());
     const userPayload = { name: doc.name, email: doc.email, picture: doc.picture, _id: doc._id };
 
-    // Parse optional mobile deep-link from state
+    // state may contain app_redirect
     let app_redirect;
     if (state) {
       try {
         const s = JSON.parse(Buffer.from(String(state), 'base64url').toString('utf8'));
         app_redirect = s?.app_redirect;
-        console.log('[CALLBACK] Parsed app_redirect from state:', app_redirect);
-      } catch (e) {
-        console.error('[CALLBACK] Failed to parse state:', e);
-      }
+      } catch {}
     }
 
     if (app_redirect) {
       const b64 = Buffer.from(JSON.stringify({ token, user: userPayload })).toString('base64');
 
-      // Detect Expo AuthSession proxy (supports .dev and .io)
-      const isExpoProxy = /https:\/\/auth\.expo\.(dev|io)\//i.test(app_redirect);
+      // ✅ Treat both new and old Expo proxy domains as “proxy mode”
+      const isExpoProxy =
+        app_redirect.includes('auth.expo.dev') ||
+        app_redirect.includes('auth.expo.io') ||
+        app_redirect.includes('expo-auth-session');
 
       if (isExpoProxy) {
-        // Expo proxy expects fragment (#vm=...), not query
+        // Expo proxy expects fragment, not query
         const redirectUrl = `${app_redirect}#vm=${encodeURIComponent(b64)}`;
-        console.log('[CALLBACK] Expo proxy redirect ->', redirectUrl);
-
         return res
           .set('Content-Type', 'text/html')
           .send(`<!doctype html><meta charset="utf-8" />
 <title>Redirecting…</title>
-<p>Authentication successful! Redirecting back to the app…</p>
 <script>
-  (function(u){
-    try { window.location.replace(u); } catch(e) { try { window.location.href = u; } catch(_){} }
-    setTimeout(function(){ window.location = u; }, 100);
-  })(${JSON.stringify(redirectUrl)});
+  var u=${JSON.stringify(redirectUrl)};
+  try { location.replace(u); } catch(e) { location.href = u; }
+  setTimeout(function(){ location = u; }, 120);
 </script>
-<noscript><meta http-equiv="refresh" content="0;url=${redirectUrl}"></noscript>`);
-      } else {
-        // Native/dev-client deep link: use query (?vm=)
-        const sep = app_redirect.includes('?') ? '&' : '?';
-        const redirectUrl = `${app_redirect}${sep}vm=${encodeURIComponent(b64)}`;
-        console.log('[CALLBACK] Native redirect ->', redirectUrl);
-        return res.redirect(redirectUrl);
+<p>Redirecting back to the app…</p>`);
       }
+
+      // Standalone/dev-client: deep link directly
+      const sep = app_redirect.includes('?') ? '&' : '?';
+      return res.redirect(`${app_redirect}${sep}vm=${encodeURIComponent(b64)}`);
     }
 
-    // Web popup fallback (postMessage back to opener)
+    // Web popup fallback
     const targetOrigin = WEB_ORIGIN || '*';
     return res
       .set('Content-Type', 'text/html')
@@ -270,10 +298,10 @@ app.get('/auth/callback', async (req, res) => {
    window.close();
  })();
 </script>
-<p>Authentication successful. You can close this window.</p>`);
+<p>You can close this window.</p>`);
   } catch (e) {
     console.error('[OAUTH CALLBACK ERROR]', e);
-    return res.status(500).send('OAuth callback failed: ' + (e && e.message || 'unknown'));
+    return res.status(500).send('OAuth callback failed: ' + e.message);
   }
 });
 
