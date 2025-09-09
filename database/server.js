@@ -111,6 +111,7 @@ app.get('/', (_req, res) => res.send('OK'));
 // ============================================================
 app.post('/auth/google/native', async (req, res) => {
   try {
+    console.log(req.body);
     const { idToken } = req.body || {};
     if (!idToken) return res.status(400).json({ error: 'missing idToken' });
     const ticket = await oauthVerify.verifyIdToken({ idToken, audience: GOOGLE_WEB_CLIENT_ID });
