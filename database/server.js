@@ -111,16 +111,20 @@ app.get('/', (_req, res) => res.send('OK'));
 // A) MOBILE/WEB AUTH
 // ============================================================
 // server.js (excerpt)
-
+// server.js (excerpt)
 app.post('/auth/google/native', async (req, res) => {
   try {
     const { idToken } = req.body || {};
     if (!idToken) return res.status(400).json({ error: 'missing idToken' });
 
+    // ✅ Use your WEB client ID here (NOT the Android client)
+    const { GOOGLE_WEB_CLIENT_ID } = process.env;
+
     const ticket = await oauthVerify.verifyIdToken({
       idToken,
-      audience: process.env.GOOGLE_ANDROID_CLIENT_ID, // the Web client ID
+      audience: GOOGLE_WEB_CLIENT_ID, // must match the webClientId you configured on the app
     });
+
     const p = ticket.getPayload();
     if (!p?.sub) return res.status(400).json({ error: 'invalid idToken' });
 
@@ -138,11 +142,11 @@ app.post('/auth/google/native', async (req, res) => {
       { upsert: true }
     );
 
-    const doc = await Users.findOne({ googleId: p.sub });
+    const doc = await Users.findOne({ googleId: p.sub }, { projection: { _id: 1, name: 1, email: 1, picture: 1 } });
     if (!doc) return res.status(500).json({ error: 'user upsert failed' });
 
     const token = signSession(doc._id.toString()); // your JWT
-    const userPayload = { name: doc.name, email: doc.email, picture: doc.picture, _id: doc._id };
+    const userPayload = { _id: doc._id, name: doc.name, email: doc.email, picture: doc.picture };
 
     return res.json({ token, user: userPayload });
   } catch (e) {
@@ -150,6 +154,7 @@ app.post('/auth/google/native', async (req, res) => {
     return res.status(500).json({ error: 'native auth failed' });
   }
 });
+
 
 
 app.get('/auth/google/start', (req, res) => {
