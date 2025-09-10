@@ -370,9 +370,145 @@ app.get('/users/:id/basic', async (req, res) => {
 });
 
 // ============================================================
-// B) Devices API (unchanged – keep your current endpoints)
+// B) Devices API
 // ============================================================
-// ...
+
+// Ensure a unique index on device id (safe to call once at boot)
+await Devices.createIndex({ id: 1 }, { unique: true }).catch(() => {});
+
+// GET /devices/:id  -> 200 { id, ownerId, label, platform, model, sharing, lastSeenAt }
+app.get('/devices/:id', async (req, res) => {
+  try {
+    if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
+
+    const id = String(req.params.id || '').trim();
+    if (!id) return res.status(400).json({ error: 'invalid_id' });
+
+    const dev = await Devices.findOne({ id });
+    if (!dev) return res.status(404).json({ error: 'not_found' });
+
+    // Only owner can read their device
+    if (String(dev.ownerId) !== String(req.userId)) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+
+    return res.json({
+      id: dev.id,
+      ownerId: String(dev.ownerId),
+      label: dev.label || null,
+      platform: dev.platform || null,
+      model: dev.model || null,
+      sharing: !!dev.sharing,
+      lastSeenAt: dev.lastSeenAt ? new Date(dev.lastSeenAt).toISOString() : null,
+    });
+  } catch (e) {
+    console.error('[DEVICES GET ERROR]', e);
+    return res.status(500).json({ error: 'server_error' });
+  }
+});
+
+// POST /devices/register  body: { id, label?, platform?, model? }
+app.post('/devices/register', async (req, res) => {
+  try {
+    if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
+
+    const { id, label, platform, model } = req.body || {};
+    if (!id || typeof id !== 'string') return res.status(400).json({ error: 'id_required' });
+
+    const now = Date.now();
+    const ownerId = objId(req.userId);
+
+    const existing = await Devices.findOne({ id });
+
+    // If device already exists under someone else, block
+    if (existing && String(existing.ownerId) !== String(ownerId)) {
+      return res.status(409).json({ error: 'device_owned_by_another_account' });
+    }
+
+    const doc = {
+      id,
+      ownerId,
+      label: typeof label === 'string' ? label : (existing?.label || null),
+      platform: typeof platform === 'string' ? platform : (existing?.platform || null),
+      model: typeof model === 'string' ? model : (existing?.model || null),
+      sharing: existing?.sharing === true,  // default false unless previously enabled
+      lastSeenAt: existing?.lastSeenAt || null,
+      updatedAt: now,
+      createdAt: existing?.createdAt || now,
+    };
+
+    await Devices.updateOne({ id }, { $set: doc }, { upsert: true });
+
+    return res.json({
+      id: doc.id,
+      ownerId: String(doc.ownerId),
+      label: doc.label,
+      platform: doc.platform,
+      model: doc.model,
+      sharing: !!doc.sharing,
+      lastSeenAt: doc.lastSeenAt ? new Date(doc.lastSeenAt).toISOString() : null,
+    });
+  } catch (e) {
+    console.error('[DEVICES REGISTER ERROR]', e);
+    // duplicate key (race) -> 409
+    if (String(e?.code) === '11000') {
+      return res.status(409).json({ error: 'duplicate_device' });
+    }
+    return res.status(500).json({ error: 'server_error' });
+  }
+});
+
+// POST /devices/:id/sharing  body: { sharing: boolean }
+app.post('/devices/:id/sharing', async (req, res) => {
+  try {
+    if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
+    const id = String(req.params.id || '').trim();
+    if (!id) return res.status(400).json({ error: 'invalid_id' });
+
+    const dev = await Devices.findOne({ id });
+    if (!dev) return res.status(404).json({ error: 'not_found' });
+    if (String(dev.ownerId) !== String(req.userId)) return res.status(403).json({ error: 'forbidden' });
+
+    const sharing = !!req.body?.sharing;
+    await Devices.updateOne({ id }, { $set: { sharing, updatedAt: Date.now() } });
+    const updated = await Devices.findOne({ id });
+
+    return res.json({
+      id: updated.id,
+      ownerId: String(updated.ownerId),
+      label: updated.label || null,
+      platform: updated.platform || null,
+      model: updated.model || null,
+      sharing: !!updated.sharing,
+      lastSeenAt: updated.lastSeenAt ? new Date(updated.lastSeenAt).toISOString() : null,
+    });
+  } catch (e) {
+    console.error('[DEVICES SHARING ERROR]', e);
+    return res.status(500).json({ error: 'server_error' });
+  }
+});
+
+// POST /devices/:id/touch  body: { lastSeenAt: number }
+app.post('/devices/:id/touch', async (req, res) => {
+  try {
+    if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
+    const id = String(req.params.id || '').trim();
+    if (!id) return res.status(400).json({ error: 'invalid_id' });
+
+    const dev = await Devices.findOne({ id });
+    if (!dev) return res.status(404).json({ error: 'not_found' });
+    if (String(dev.ownerId) !== String(req.userId)) return res.status(403).json({ error: 'forbidden' });
+
+    const ts = Number(req.body?.lastSeenAt) || Date.now();
+    await Devices.updateOne({ id }, { $set: { lastSeenAt: ts, updatedAt: Date.now() } });
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('[DEVICES TOUCH ERROR]', e);
+    return res.status(500).json({ error: 'server_error' });
+  }
+});
+
 
 // ============================================================
 // C) Lobby / Grants (invite, accept, reject, revoke, list, requests, ACL)
