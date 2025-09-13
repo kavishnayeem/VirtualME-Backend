@@ -356,6 +356,26 @@ app.put('/me', async (req, res) => {
   }
 });
 
+// Update Voice Id
+app.put('/me/voice-id', async (req, res) => {
+  try {
+    if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
+
+    const voiceId = String(req.body?.voiceId || '').trim();
+    if (!voiceId) return res.status(400).json({ error: 'voiceId_required' });
+
+    await Users.updateOne(
+      { _id: objId(req.userId) },
+      { $set: { voiceId, updatedAt: new Date() } }
+    );
+
+    return res.json({ ok: true, voiceId });
+  } catch (e) {
+    console.error('[VOICEID UPDATE ERROR]', e);
+    return res.status(500).json({ error: 'update_failed' });
+  }
+});
+
 app.get('/users/:id/basic', async (req, res) => {
   try {
     const u = await Users.findOne(
