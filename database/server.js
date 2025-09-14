@@ -178,6 +178,75 @@ app.get('/auth/google/start', (req, res) => {
   res.redirect(url);
 });
 
+// ============================================================
+// Calendar: GET /calendar/next
+// Requires: user session (Authorization: Bearer <your JWT>)
+// Stores refreshToken in Users (already handled in /auth/callback)
+// ============================================================
+app.get('/calendar/next', async (req, res) => {
+  try {
+    if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
+
+    // Fetch the current user with their Google tokens
+    const user = await Users.findOne(
+      { _id: objId(req.userId) },
+      { projection: { _id: 1, email: 1, refreshToken: 1 } }
+    );
+    if (!user) return res.status(404).json({ error: 'user_not_found' });
+
+    // We need a refresh token from the web OAuth flow to read Calendar
+    if (!user.refreshToken) {
+      return res.status(400).json({
+        error: 'google_not_connected',
+        message:
+          'No Google refresh token on file. Reconnect via /auth/google/start to grant Calendar access.',
+      });
+    }
+
+    // Build OAuth2 client
+    const oauth2Client = new OAuth2Client({
+      clientId: GOOGLE_WEB_CLIENT_ID,
+      clientSecret: GOOGLE_WEB_CLIENT_SECRET,
+      redirectUri: REDIRECT_URI, // must match what you used in the consent flow
+    });
+
+    // Use stored refresh token; googleapis will auto-refresh access tokens
+    oauth2Client.setCredentials({ refresh_token: user.refreshToken });
+
+    const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
+
+    const nowIso = new Date().toISOString();
+    const calendarId = String(req.query.calendarId || 'primary');
+
+    const { data } = await calendar.events.list({
+      calendarId,
+      timeMin: nowIso,
+      maxResults: 1,
+      singleEvents: true,
+      orderBy: 'startTime',
+    });
+
+    const event = (data.items && data.items[0]) || null;
+    if (!event) return res.json({ message: 'No upcoming events.' });
+
+    return res.json({
+      id: event.id,
+      summary: event.summary || '(no title)',
+      start: event.start?.dateTime || event.start?.date || null,
+      end: event.end?.dateTime || event.end?.date || null,
+      location: event.location || null,
+      hangoutLink: event.hangoutLink || null,
+      organizer: event.organizer?.email || null,
+      // include raw if you want more fields client-side:
+      // raw: event,
+    });
+  } catch (e) {
+    console.error('[CALENDAR NEXT ERROR]', e);
+    // Always return JSON (never HTML), so the client can parse safely
+    return res.status(500).json({ error: 'calendar_failed' });
+  }
+});
+
 
 // /auth/callback  (JS)
 app.get('/auth/callback', async (req, res) => {
