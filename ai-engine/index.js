@@ -17,19 +17,27 @@ app.use(cors({
     'Content-Type',
     'Accept',
     'Authorization',
-    'X-VM-Reason',        // <— needed for your custom header
+    'X-VM-Reason',
   ],
+  // expose all useful metadata headers to the browser
   exposedHeaders: [
-    'X-Store',            // optional: so r.headers.get('x-store') works in browsers
+    'X-Store',
     'X-User',
-    'X-Saved-At'
+    'X-Saved-At',
+    'X-Reply-Text',
+    'X-Transcript',
+    'X-Language',
+    'X-Voice-Id',
+    'X-Conversation-Id',
+    'X-Target-UserId',
   ],
 }));
 
 const isVercel     = process.env.VERCEL === '1';
 const GROQ_KEY     = process.env.GROQ_API_KEY;
 const ELEVEN_URL   = process.env.VOICE_BACKEND_BASE || 'https://virtual-me-backend.vercel.app'; // TTS proxy
-const AUTH_API     = process.env.AUTH_API_BASE || 'https://virtual-me-auth.vercel.app';         // <— DB server base
+const AUTH_API     = process.env.AUTH_API_BASE || 'https://virtual-me-auth.vercel.app';
+const PUBLIC_DEFAULT_TARGET_USER_ID = (process.env.PUBLIC_DEFAULT_TARGET_USER_ID || '').trim() || null;
 
 const DEFAULT_VOICE_ID = process.env.VOICE_ID || 'FXeTfnSWNOAh4GQOUctK';
 const STT_MODEL  = process.env.GROQ_STT_MODEL  || 'whisper-large-v3-turbo';
@@ -38,6 +46,9 @@ const MAX_TOKENS = Number(process.env.MAX_TOKENS || 768);
 
 if (!GROQ_KEY) console.warn('⚠️ Missing GROQ_API_KEY');
 if (!AUTH_API) console.warn('⚠️ Missing AUTH_API_BASE (defaults to virtual-me-auth.vercel.app)');
+if (!PUBLIC_DEFAULT_TARGET_USER_ID) {
+  console.warn('ℹ️ PUBLIC_DEFAULT_TARGET_USER_ID not set — unauthenticated /voice calls will require targetUserId OR be rejected.');
+}
 
 // ---------- In-memory conversation history ----------
 const CONVO_TTL_MS = 30 * 60 * 1000;
@@ -152,9 +163,8 @@ function languageLabel(code) {
   const m = code.toLowerCase();
   const map = {
     'en': 'English', 'en-us': 'English', 'en-gb': 'English',
-      'es': 'Spanish', 
-    'hi': 'Hindi',   'ur': 'Urdu',     'ar': 'Arabic',
-    
+    'es': 'Spanish',
+    'hi': 'Hindi', 'ur': 'Urdu', 'ar': 'Arabic',
   };
   return map[m] || code;
 }
@@ -214,6 +224,7 @@ GET  /location/debug?userId=<id>
 Store: ${storeKind()}
 Models: STT=${STT_MODEL}, Chat=${CHAT_MODEL}, max_tokens=${MAX_TOKENS}
 AUTH_API: ${AUTH_API}
+PUBLIC_DEFAULT_TARGET_USER_ID: ${PUBLIC_DEFAULT_TARGET_USER_ID || '(not set)'}
 `);
 });
 app.get('/healthz', (_req, res) => res.json({ ok: true, ts: Date.now() }));
@@ -345,25 +356,41 @@ app.post('/voice', upload.single('audio'), async (req, res) => {
       targetUserId: targetUserIdRaw,
     } = req.body || {};
 
-    // 0) Identify caller (me) and resolve effective target
+    // 0) Identify caller (me) if authed
     let me = null;
     if (bearer) {
       const respMe = await dbGET('/me', bearer);
       if (respMe.ok) me = await respMe.json(); // {_id, name, email, ...}
     }
     const myId = me?._id || null;
-    const targetUserId = (targetUserIdRaw && String(targetUserIdRaw).trim()) || myId || null;
-    if (!targetUserId) {
-      return res.status(401).type('text/plain; charset=utf-8').send('Sign in required');
-    }
 
-    // 0.1) ACL: can I act as target?
-    if (myId !== targetUserId) {
-      const acl = await dbGET(`/acl/can-act-as?target=${encodeURIComponent(targetUserId)}`, bearer);
-      if (acl.status === 403) return res.status(403).type('text/plain; charset=utf-8').send('Access denied');
-      if (!acl.ok) return res.status(502).type('text/plain; charset=utf-8').send('ACL check failed');
-      const j = await acl.json();
-      if (!j?.allowed) return res.status(403).type('text/plain; charset=utf-8').send('Access denied');
+    // 0.1) Resolve effective target (supports public fallback)
+    let targetUserId = (targetUserIdRaw && String(targetUserIdRaw).trim()) || null;
+
+    if (bearer) {
+      // Signed-in: default to acting as self if no explicit target
+      if (!targetUserId) targetUserId = myId;
+      if (!targetUserId) {
+        return res.status(401).type('text/plain; charset=utf-8').send('Sign in required');
+      }
+      // ACL if acting as someone else
+      if (myId !== targetUserId) {
+        const acl = await dbGET(`/acl/can-act-as?target=${encodeURIComponent(targetUserId)}`, bearer);
+        if (acl.status === 403) return res.status(403).type('text/plain; charset=utf-8').send('Access denied');
+        if (!acl.ok) return res.status(502).type('text/plain; charset=utf-8').send('ACL check failed');
+        const j = await acl.json();
+        if (!j?.allowed) return res.status(403).type('text/plain; charset=utf-8').send('Access denied');
+      }
+    } else {
+      // Not signed-in: only allow the configured public target
+      if (!targetUserId) targetUserId = PUBLIC_DEFAULT_TARGET_USER_ID;
+      if (!targetUserId) {
+        return res.status(401).type('text/plain; charset=utf-8')
+          .send('auth_required_or_public_target_not_configured');
+      }
+      if (PUBLIC_DEFAULT_TARGET_USER_ID && targetUserId !== PUBLIC_DEFAULT_TARGET_USER_ID) {
+        return res.status(403).type('text/plain; charset=utf-8').send('forbidden_public_target');
+      }
     }
 
     // 0.2) Persona defaults from DB (if frontend didn't pass)
