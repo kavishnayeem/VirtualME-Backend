@@ -10,7 +10,21 @@ import multer from 'multer';
 // ---------- Config ----------
 const app = express();
 app.use(express.json({ limit: '1mb', type: ['application/json', 'text/json'] }));
-app.use(cors({ origin: '*', allowedHeaders: ['Content-Type', 'Accept', 'Authorization'] }));
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: [
+    'Content-Type',
+    'Accept',
+    'Authorization',
+    'X-VM-Reason',        // <— needed for your custom header
+  ],
+  exposedHeaders: [
+    'X-Store',            // optional: so r.headers.get('x-store') works in browsers
+    'X-User',
+    'X-Saved-At'
+  ],
+}));
 
 const isVercel     = process.env.VERCEL === '1';
 const GROQ_KEY     = process.env.GROQ_API_KEY;
