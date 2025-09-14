@@ -19,7 +19,6 @@ app.use(cors({
     'Authorization',
     'X-VM-Reason',
   ],
-  // expose all useful metadata headers to the browser
   exposedHeaders: [
     'X-Store',
     'X-User',
@@ -158,24 +157,27 @@ function timeAgo(ms) {
   const h = Math.round(m / 60);
   return `${h} hour(s) ago`;
 }
-function languageLabel(code) {
-  if (!code) return 'the same language as the user';
-  const m = code.toLowerCase();
-  const map = {
-    'en': 'English', 'en-us': 'English', 'en-gb': 'English',
-    'es': 'Spanish',
-    'hi': 'Hindi', 'ur': 'Urdu', 'ar': 'Arabic',
-  };
-  return map[m] || code;
+
+// --- Language helpers: only English/Hindi; prefer English unless Hindi detected ---
+function pickAllowedLanguage(langCodeFromSTT) {
+  const m = String(langCodeFromSTT || '').toLowerCase();
+  if (m.startsWith('hi')) return 'Hindi';
+  // Fallback/most cases
+  return 'English';
 }
-function buildSystemPrompt({ full, short }, languageName) {
-  return [
-    `You are the person "${full}" (preferred name: "${short}").`,
-    `Speak in first person as ${short}. Never say you're an assistant.`,
-    `Keep replies natural and concise. Reply only in ${languageName}.`,
-    `Do not invent calendar/location; use only provided context.`,
-  ].join(' ');
+
+// --- Location gating: include location context only when asked ---
+const LOCATION_QUERIES = [
+  'where am i', 'where are you', 'where', 'location', 'address', 'near', 'nearby', 'distance',
+  'kahan', 'kahaan', 'kidhar', 'kaan', 'address kya', 'location kya'
+];
+function asksForLocation(text) {
+  if (!text) return false;
+  const t = text.toLowerCase();
+  return LOCATION_QUERIES.some(q => t.includes(q));
 }
+
+// --- Name coalescing and voice sanitization ---
 function coalesceName(profileName, preferredName, fallbackFull = 'Kavish Nayeem', fallbackShort = 'Kavish') {
   const full = (profileName || '').trim() || fallbackFull;
   const short = (preferredName || '').trim() || fallbackShort;
@@ -185,6 +187,22 @@ function sanitizeVoiceId(voiceId) {
   if (!voiceId) return '';
   if (!/^[A-Za-z0-9\-_]{6,64}$/.test(voiceId)) return '';
   return voiceId;
+}
+
+// --- System prompt (UPDATED to your rules) ---
+function buildSystemPrompt({ full, short }, languageName, { firstTurn }) {
+  // A tight, explicit policy the model must follow
+  return [
+    `You are "${full}" (preferred name: "${short}"). Speak ONLY in ${languageName}.`,
+    `Use first person as ${short}. Never call yourself an assistant or talk about being an AI.`,
+    `Prefer short, natural sentences. Keep it conversational, not verbose.`,
+    `If you are uncertain or lack context, say "I don't know" (or its ${languageName} equivalent). Do not fabricate or assume.`,
+    `Do NOT disclose your or the user's location unless explicitly asked in the user's message.`,
+    `Use ONLY the provided context. Do NOT invent calendar, contacts, or locations.`,
+    `Do NOT blindly accept claims from the user; verify against the provided context. If unsure, say you don't know.`,
+    `Stay within scope. If a request is outside context, say you don't know or ask for more info.`,
+    firstTurn ? `On your very first reply in this conversation, start with a brief greeting and your name (one short sentence), then answer.` : ``
+  ].filter(Boolean).join('\n');
 }
 
 // ---------- Auth DB helpers ----------
@@ -248,20 +266,17 @@ app.post('/location/update', async (req, res) => {
       return res.status(400).json({ error: 'invalid payload' });
     }
 
-    // Resolve device -> owner and sharing state from DB
     const resp = await dbGET(`/devices/${encodeURIComponent(deviceId)}`, auth);
     if (resp.status === 404) return res.status(403).json({ error: 'device not registered' });
     if (!resp.ok) return res.status(502).json({ error: 'device lookup failed' });
-    const dev = await resp.json(); // { id, ownerId, sharing, ... }
+    const dev = await resp.json();
     if (!dev?.ownerId) return res.status(403).json({ error: 'device has no owner' });
     if (dev.sharing !== true) return res.status(403).json({ error: 'sharing disabled for this device' });
 
-    // Persist latest location per user
     const key = `loc:${dev.ownerId}`;
     const doc = { ...payload, updatedAt: Date.now(), deviceId };
     await storeSet(key, doc);
 
-    // Update device last seen
     await dbPOST(`/devices/${encodeURIComponent(deviceId)}/touch`, auth, { lastSeenAt: doc.updatedAt }).catch(()=>{});
 
     res.setHeader('X-Store', storeKind());
@@ -336,7 +351,7 @@ async function latestLocationText(userId) {
   return `Last seen near ${streety} (${timeAgo(ageMs)}).${acc}`;
 }
 
-// ---------- VOICE: audio -> STT -> Chat -> TTS (with ACL and persona) ----------
+// ---------- VOICE: audio -> STT -> Chat -> TTS (with ACL, persona, & prompt rules) ----------
 app.post('/voice', upload.single('audio'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).type('text/plain; charset=utf-8').send('No file uploaded as "audio"');
@@ -356,24 +371,22 @@ app.post('/voice', upload.single('audio'), async (req, res) => {
       targetUserId: targetUserIdRaw,
     } = req.body || {};
 
-    // 0) Identify caller (me) if authed
+    // Identify caller (me) if authed
     let me = null;
     if (bearer) {
       const respMe = await dbGET('/me', bearer);
-      if (respMe.ok) me = await respMe.json(); // {_id, name, email, ...}
+      if (respMe.ok) me = await respMe.json();
     }
     const myId = me?._id || null;
 
-    // 0.1) Resolve effective target (supports public fallback)
+    // Resolve effective target (supports public fallback)
     let targetUserId = (targetUserIdRaw && String(targetUserIdRaw).trim()) || null;
 
     if (bearer) {
-      // Signed-in: default to acting as self if no explicit target
       if (!targetUserId) targetUserId = myId;
       if (!targetUserId) {
         return res.status(401).type('text/plain; charset=utf-8').send('Sign in required');
       }
-      // ACL if acting as someone else
       if (myId !== targetUserId) {
         const acl = await dbGET(`/acl/can-act-as?target=${encodeURIComponent(targetUserId)}`, bearer);
         if (acl.status === 403) return res.status(403).type('text/plain; charset=utf-8').send('Access denied');
@@ -382,7 +395,6 @@ app.post('/voice', upload.single('audio'), async (req, res) => {
         if (!j?.allowed) return res.status(403).type('text/plain; charset=utf-8').send('Access denied');
       }
     } else {
-      // Not signed-in: only allow the configured public target
       if (!targetUserId) targetUserId = PUBLIC_DEFAULT_TARGET_USER_ID;
       if (!targetUserId) {
         return res.status(401).type('text/plain; charset=utf-8')
@@ -393,7 +405,7 @@ app.post('/voice', upload.single('audio'), async (req, res) => {
       }
     }
 
-    // 0.2) Persona defaults from DB (if frontend didn't pass)
+    // Persona defaults from DB (if frontend didn't pass)
     let personaFull = profileName || '';
     let personaShort = preferredName || '';
     let personaVoice = sanitizeVoiceId(voiceIdRaw) || '';
@@ -431,20 +443,27 @@ app.post('/voice', upload.single('audio'), async (req, res) => {
     const sttJson = await sttResp.json();
     const transcript = (sttJson?.text || '').trim();
     const langCode = (sttJson?.language || '').trim();
-    const langName = languageLabel(langCode || '');
 
-    // 1.5) Build location context for the target user
-    const locText = await latestLocationText(targetUserId);
+    // 1.1) Language selection: only EN/HIN; prefer EN unless Hindi detected
+    const languageName = pickAllowedLanguage(langCode);
 
-    // 2) Chat messages with prior history
+    // 1.5) Build location context only if asked
+    const includeLoc = asksForLocation(transcript);
+    const locText = includeLoc ? await latestLocationText(targetUserId) : null;
+
+    // 2) Chat messages with prior history (+ system rules)
     const history = getHistory(conversationId);
-    const systemMsg = buildSystemPrompt(persona, langName);
+    const firstTurn = history.length === 0;
+    const systemMsg = buildSystemPrompt(persona, languageName, { firstTurn });
+
     const messages = [
       { role: 'system', content: systemMsg },
       ...history,
-      { role: 'system', content: `Context: ${locText}` },
+      ...(includeLoc ? [{ role: 'system', content: `Context: ${locText}` }] : []),
       ...(hints ? [{ role: 'system', content: `Extra app context: ${hints}` }] : []),
       { role: 'user', content: transcript || 'Greet politely.' },
+      // Guard-rail assistant reminder (soft): keep terse, no new facts
+      { role: 'system', content: `Answer only with information you truly know from context or the user input. If unsure, say "I don't know." Keep it under 60 words unless asked to elaborate.` }
     ];
 
     // 3) Chat completion
@@ -457,7 +476,7 @@ app.post('/voice', upload.single('audio'), async (req, res) => {
       },
       body: JSON.stringify({
         model: CHAT_MODEL,
-        temperature: 0.4,
+        temperature: 0.3,     // a bit tighter to reduce creative drift
         max_tokens: MAX_TOKENS,
         messages,
       }),
@@ -478,7 +497,7 @@ app.post('/voice', upload.single('audio'), async (req, res) => {
       { role: 'assistant', content: replyText },
     ]);
 
-    // 5) TTS (forward bearer to voice backend if it needs to enforce anything)
+    // 5) TTS
     const ttsBody = sanitizeVoiceId(personaVoice)
       ? { voiceId: sanitizeVoiceId(personaVoice), text: replyText }
       : { text: replyText };
@@ -501,7 +520,7 @@ app.post('/voice', upload.single('audio'), async (req, res) => {
     res.setHeader('Content-Type', 'audio/wav');
     res.setHeader('X-Reply-Text', encodeURIComponent(replyText));
     res.setHeader('X-Transcript', encodeURIComponent((transcript || '').slice(0, 800)));
-    res.setHeader('X-Language', encodeURIComponent(langCode || 'unknown'));
+    res.setHeader('X-Language', encodeURIComponent(langCode || 'unknown')); // raw STT code
     res.setHeader('X-Voice-Id', encodeURIComponent(sanitizeVoiceId(personaVoice) || ''));
     res.setHeader('X-Conversation-Id', encodeURIComponent(conversationId || ''));
     res.setHeader('X-Target-UserId', encodeURIComponent(targetUserId));
