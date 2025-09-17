@@ -176,15 +176,15 @@ app.post("/speak", async (req, res) => {
     if (!voiceId && req.userId) {
       const _id = new ObjectId(req.userId);
       const user = await Users.findOne({ _id }, { projection: { voiceId: 1 } });
-      voiceId = user?.voiceId || "";
+      // If user.voiceId is null/undefined/empty, fallback to default
+      voiceId = user?.voiceId ? String(user.voiceId).trim() : "";
     }
 
-    // Final fallback to your default voice
+    // Final fallback to your default voice if not found or invalid
     if (!voiceId) voiceId = DEFAULT_VOICE_ID || "";
-    if (!voiceId)
-      return res
-        .status(400)
-        .send("No voiceId available (user has none and no DEFAULT_VOICE_ID set)");
+
+    // If still not found, just use the default (even if empty, ElevenLabs will error)
+    // But do NOT throw error if user has no voiceId, just use default
 
     const payload = {
       text:
