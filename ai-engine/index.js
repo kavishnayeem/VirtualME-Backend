@@ -351,31 +351,43 @@ async function latestLocationText(userId) {
 }
 
 // ==== CALENDAR INTEGRATION (NEW) ============================================
+// Replace your existing fetchNextCalendarEvent with this:
+async function fetchNextCalendarEvent({ bearer, calendarId = 'primary', targetUserId, myId }) {
+  if (!bearer) return null; // must be signed in to read calendars
 
-// Pulls the next event via your auth API; returns a short, safe summary or null
-async function fetchNextCalendarEvent(bearer, calendarId = 'primary') {
-  if (!bearer) return null;
   try {
-    const url = `${AUTH_API}/calendar/next?calendarId=${encodeURIComponent(calendarId)}`;
-    const r = await fetch(url, { headers: { Authorization: `Bearer ${bearer}`, Accept: 'application/json' } });
+    const actingAsOther = targetUserId && myId && String(targetUserId) !== String(myId);
+
+    // Use persona endpoint when acting as someone else; otherwise use self
+    const url = actingAsOther
+      ? `${AUTH_API}/people/${encodeURIComponent(targetUserId)}/calendar/next?limit=1&calendarId=${encodeURIComponent(calendarId)}`
+      : `${AUTH_API}/calendar/next?calendarId=${encodeURIComponent(calendarId)}`;
+
+    const r = await fetch(url, {
+      headers: { Authorization: `Bearer ${bearer}`, Accept: 'application/json' },
+    });
     if (!r.ok) return null;
     const j = await r.json();
-    if (!j || j.message === 'No upcoming events.' || !j.start) return null;
 
-    // format as concise context for the model
-    const startIso = j.start;
-    const endIso   = j.end || null;
+    // Self endpoint returns a single event object; persona endpoint returns an array
+    const evt = Array.isArray(j) ? (j[0] || null) : j;
+    if (!evt) return null;
 
-    // Keep formatting locale-neutral to prevent time confusion; the model can rephrase
-    const windowTxt = endIso ? `${startIso} → ${endIso}` : startIso;
-    const whereTxt  = j.location ? ` at ${j.location}` : '';
-    const byTxt     = j.organizer ? ` (organizer: ${j.organizer})` : '';
+    const title = evt.title || evt.summary || '(no title)';
+    const startIso = evt.start || null;
+    const endIso   = evt.end || null;
+    if (!startIso) return null;
 
-    return `Next calendar event: "${j.summary || '(no title)'}"${whereTxt}, ${windowTxt}${byTxt}.`;
+    const whenTxt  = endIso ? `${startIso} → ${endIso}` : startIso;
+    const whereTxt = evt.location ? ` at ${evt.location}` : '';
+    const orgTxt   = evt.organizer ? ` (organizer: ${evt.organizer})` : ''; // may be missing on persona route
+
+    return `Next calendar event: "${title}"${whereTxt}, ${whenTxt}${orgTxt}.`;
   } catch {
     return null;
   }
 }
+
 
 // Simple check for schedule/time intent; we still include calendar context by default
 const SCHEDULE_QUERIES = [
@@ -495,7 +507,12 @@ app.post('/voice', upload.single('audio'), async (req, res) => {
     // We proactively fetch it when authed; model will use it only if relevant.
     let calendarContext = null;
     if (bearer) {
-      calendarContext = await fetchNextCalendarEvent(bearer, calendarIdRaw || 'primary');
+      calendarContext = await fetchNextCalendarEvent({
+        bearer,
+        calendarId: calendarIdRaw || 'primary',
+        targetUserId,
+        myId,
+      });
     }
     // =====================================================================
 
