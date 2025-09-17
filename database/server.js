@@ -156,6 +156,45 @@ app.post('/auth/google/native', async (req, res) => {
 });
 
 
+// NEW: /auth/dev-impersonate  (DEV ONLY)
+app.post('/auth/dev-impersonate', async (req, res) => {
+  try {
+    const DEV_KEY = process.env.DEV_IMPERSONATE_KEY;
+    if (!DEV_KEY) return res.status(403).json({ error: 'disabled' });
+
+    const key = req.headers['x-dev-key'];
+    if (!key || key !== DEV_KEY) return res.status(403).json({ error: 'forbidden' });
+
+    const { userId, email } = req.body || {};
+    if (!userId && !email) return res.status(400).json({ error: 'userId_or_email_required' });
+
+    const query = userId ? { _id: objId(userId) } : { email: String(email).toLowerCase() };
+    const doc = await Users.findOne(query, { projection: { _id: 1, name: 1, email: 1, picture: 1 } });
+    if (!doc) return res.status(404).json({ error: 'user_not_found' });
+
+    const token = signSession(doc._id.toString());
+    const userPayload = { _id: doc._id, name: doc.name, email: doc.email, picture: doc.picture };
+
+    // default: JSON (simple)
+    if (!('popup' in req.query)) return res.json({ token, user: userPayload });
+
+    // optional: popup helper that posts window message like your Google flow
+    const targetOrigin = process.env.WEB_ORIGIN || '*';
+    return res
+      .set('Content-Type', 'text/html')
+      .send(`<!doctype html><meta charset="utf-8" />
+<script>
+ (function(){
+   var payload = { token: ${JSON.stringify(token)}, user: ${JSON.stringify(userPayload)} };
+   if (window.opener) window.opener.postMessage({ type: 'vm-auth', payload }, '${targetOrigin}');
+   window.close();
+ })();
+</script>`);
+  } catch (e) {
+    console.error('[DEV IMPERSONATE ERROR]', e);
+    return res.status(500).json({ error: 'server_error' });
+  }
+});
 
 app.get('/auth/google/start', (req, res) => {
   if (!oauthWeb) return res.status(500).send('Server not configured for web OAuth flow');
