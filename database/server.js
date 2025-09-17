@@ -225,13 +225,19 @@ app.get('/auth/google/start', (req, res) => {
     ? Buffer.from(JSON.stringify({ app_redirect })).toString('base64url')
     : undefined;
 
-  const url = oauthWeb.generateAuthUrl({
-    access_type: 'offline',
-    prompt: 'consent',
-    scope: scopes,
-    redirect_uri: REDIRECT_URI,
-    ...(state ? { state } : {}),
-  });
+    const url = oauthWeb.generateAuthUrl({
+      access_type: 'offline',
+      prompt: 'consent',               // force the consent screen
+      include_granted_scopes: true,    // incremental auth (keeps previous grants)
+      scope: [
+        'openid',
+        'email',
+        'profile',
+        'https://www.googleapis.com/auth/calendar.readonly',
+        // (optional) 'https://www.googleapis.com/auth/calendar.events.readonly'
+      ],
+      redirect_uri: REDIRECT_URI,
+    });
   res.redirect(url);
 });
 // GET /people/:id/calendar/next?limit=3&calendarId=primary
@@ -245,7 +251,7 @@ app.get('/people/:id/calendar/next', async (req, res) => {
 
     const allowed = await canActAs(req.userId, ownerId);
     if (!allowed) return res.status(403).json({ error: 'no-grant' });
-
+    
     const owner = await Users.findOne(
       { _id: ownerObj },
       { projection: { refreshToken: 1 } }
@@ -285,6 +291,14 @@ app.get('/people/:id/calendar/next', async (req, res) => {
 
     return res.json(items);
   } catch (e) {
+    // Detect the common case: insufficient scopes
+    const msg = String(e?.message || '');
+    if (e?.code === 403 && /insufficient/i.test(msg)) {
+      return res.status(400).json({
+        error: 'google_scopes_insufficient',
+        message: 'Target user must reconnect Google Calendar and grant read access.',
+      });
+    }
     console.error('[PEOPLE CAL NEXT ERROR]', e);
     return res.status(500).json({ error: 'calendar_failed' });
   }
