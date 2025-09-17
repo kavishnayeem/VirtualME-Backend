@@ -38,7 +38,7 @@ const ELEVEN_URL   = process.env.VOICE_BACKEND_BASE || 'https://virtual-me-backe
 const AUTH_API     = process.env.AUTH_API_BASE || 'https://virtual-me-auth.vercel.app';
 const PUBLIC_DEFAULT_TARGET_USER_ID = (process.env.PUBLIC_DEFAULT_TARGET_USER_ID || '').trim() || null;
 
-const DEFAULT_VOICE_ID = process.env.VOICE_ID || 'FXeTfnSWNOAh4GQOUctK';
+const DEFAULT_VOICE_ID = process.env.VOICE_ID || '8WGkRzOA8ctbz8pu804L';
 const STT_MODEL  = process.env.GROQ_STT_MODEL  || 'whisper-large-v3-turbo';
 const CHAT_MODEL = process.env.GROQ_CHAT_MODEL || 'llama-3.1-8b-instant';
 const MAX_TOKENS = Number(process.env.MAX_TOKENS || 768);
