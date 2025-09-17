@@ -36,8 +36,9 @@ app.use(cookieParser());
 app.use(
   cors({
     origin: true,
+    
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    allowedHeaders: ['Content-Type', 'Authorization','X-Dev-Key'],
     credentials: false,
   })
 );
