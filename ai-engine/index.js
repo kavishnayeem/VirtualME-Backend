@@ -191,7 +191,6 @@ function sanitizeVoiceId(voiceId) {
 
 // --- System prompt (UPDATED to your rules) ---
 function buildSystemPrompt({ full, short }, languageName, { firstTurn }) {
-  // A tight, explicit policy the model must follow
   return [
     `You are "${full}" (preferred name: "${short}"). Speak ONLY in ${languageName}.`,
     `Use first person as ${short}. Never call yourself an assistant or talk about being an AI.`,
@@ -351,6 +350,46 @@ async function latestLocationText(userId) {
   return `Last seen near ${streety} (${timeAgo(ageMs)}).${acc}`;
 }
 
+// ==== CALENDAR INTEGRATION (NEW) ============================================
+
+// Pulls the next event via your auth API; returns a short, safe summary or null
+async function fetchNextCalendarEvent(bearer, calendarId = 'primary') {
+  if (!bearer) return null;
+  try {
+    const url = `${AUTH_API}/calendar/next?calendarId=${encodeURIComponent(calendarId)}`;
+    const r = await fetch(url, { headers: { Authorization: `Bearer ${bearer}`, Accept: 'application/json' } });
+    if (!r.ok) return null;
+    const j = await r.json();
+    if (!j || j.message === 'No upcoming events.' || !j.start) return null;
+
+    // format as concise context for the model
+    const startIso = j.start;
+    const endIso   = j.end || null;
+
+    // Keep formatting locale-neutral to prevent time confusion; the model can rephrase
+    const windowTxt = endIso ? `${startIso} → ${endIso}` : startIso;
+    const whereTxt  = j.location ? ` at ${j.location}` : '';
+    const byTxt     = j.organizer ? ` (organizer: ${j.organizer})` : '';
+
+    return `Next calendar event: "${j.summary || '(no title)'}"${whereTxt}, ${windowTxt}${byTxt}.`;
+  } catch {
+    return null;
+  }
+}
+
+// Simple check for schedule/time intent; we still include calendar context by default
+const SCHEDULE_QUERIES = [
+  'calendar', 'schedule', 'meeting', 'call', 'event', 'appointment',
+  'kab', 'kitne baje', 'time', 'slot', 'free', 'busy', 'next'
+];
+function asksForSchedule(text) {
+  if (!text) return false;
+  const t = text.toLowerCase();
+  return SCHEDULE_QUERIES.some(q => t.includes(q));
+}
+
+// ===========================================================================
+
 // ---------- VOICE: audio -> STT -> Chat -> TTS (with ACL, persona, & prompt rules) ----------
 app.post('/voice', upload.single('audio'), async (req, res) => {
   try {
@@ -369,6 +408,7 @@ app.post('/voice', upload.single('audio'), async (req, res) => {
       conversationId,
       hints,
       targetUserId: targetUserIdRaw,
+      calendarId: calendarIdRaw // (optional) allow client to specify a calendar
     } = req.body || {};
 
     // Identify caller (me) if authed
@@ -451,6 +491,14 @@ app.post('/voice', upload.single('audio'), async (req, res) => {
     const includeLoc = asksForLocation(transcript);
     const locText = includeLoc ? await latestLocationText(targetUserId) : null;
 
+    // ==== Calendar context (NEW) =========================================
+    // We proactively fetch it when authed; model will use it only if relevant.
+    let calendarContext = null;
+    if (bearer) {
+      calendarContext = await fetchNextCalendarEvent(bearer, calendarIdRaw || 'primary');
+    }
+    // =====================================================================
+
     // 2) Chat messages with prior history (+ system rules)
     const history = getHistory(conversationId);
     const firstTurn = history.length === 0;
@@ -460,9 +508,9 @@ app.post('/voice', upload.single('audio'), async (req, res) => {
       { role: 'system', content: systemMsg },
       ...history,
       ...(includeLoc ? [{ role: 'system', content: `Context: ${locText}` }] : []),
+      ...(calendarContext ? [{ role: 'system', content: `Context: ${calendarContext}` }] : []), // <-- NEW
       ...(hints ? [{ role: 'system', content: `Extra app context: ${hints}` }] : []),
       { role: 'user', content: transcript || 'Greet politely.' },
-      // Guard-rail assistant reminder (soft): keep terse, no new facts
       { role: 'system', content: `Answer only with information you truly know from context or the user input. If unsure, say "I don't know." Keep it under 60 words unless asked to elaborate.` }
     ];
 
@@ -476,7 +524,7 @@ app.post('/voice', upload.single('audio'), async (req, res) => {
       },
       body: JSON.stringify({
         model: CHAT_MODEL,
-        temperature: 0.3,     // a bit tighter to reduce creative drift
+        temperature: 0.3,
         max_tokens: MAX_TOKENS,
         messages,
       }),
@@ -520,10 +568,14 @@ app.post('/voice', upload.single('audio'), async (req, res) => {
     res.setHeader('Content-Type', 'audio/wav');
     res.setHeader('X-Reply-Text', encodeURIComponent(replyText));
     res.setHeader('X-Transcript', encodeURIComponent((transcript || '').slice(0, 800)));
-    res.setHeader('X-Language', encodeURIComponent(langCode || 'unknown')); // raw STT code
+    res.setHeader('X-Language', encodeURIComponent(langCode || 'unknown'));
     res.setHeader('X-Voice-Id', encodeURIComponent(sanitizeVoiceId(personaVoice) || ''));
     res.setHeader('X-Conversation-Id', encodeURIComponent(conversationId || ''));
     res.setHeader('X-Target-UserId', encodeURIComponent(targetUserId));
+
+    // Helpful for debugging from client:
+    if (calendarContext) res.setHeader('X-Calendar', encodeURIComponent(calendarContext));
+
     return res.status(200).send(audioBuf);
   } catch (err) {
     console.error('[VOICE ERROR]', err);
