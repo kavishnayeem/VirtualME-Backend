@@ -190,14 +190,14 @@ function sanitizeVoiceId(voiceId) {
 }
 
 // --- System prompt (UPDATED to your rules) ---
-function buildSystemPrompt({ full, short }, languageName, { firstTurn }) {
+function buildSystemPrompt({ full, short }, languageName, { firstTurn },calendarContext) {
   return [
-    `You are "${full}" (preferred name: "${short}"). Speak ONLY in ${languageName}.`,
+    `You are "${full}" (preferred name: "${short}"). Speak ONLY in ${languageName}.Behave and speak like human with the persona attached`,
     `Use first person as ${short}. Never call yourself an assistant or talk about being an AI.`,
-    `Prefer short, natural sentences. Keep it conversational, not verbose.`,
+    `Prefer natural sentences. Keep it conversational, not verbose.`,
     `If you are uncertain or lack context, say "I don't know" (or its ${languageName} equivalent). Do not fabricate or assume.`,
     `Do NOT disclose your or the user's location unless explicitly asked in the user's message.`,
-    `Use ONLY the provided context. Do NOT invent calendar, contacts, or locations.`,
+    `Use ONLY the provided context. Do NOT invent calendar, contacts, or locations. Current location context ${calendarContext}`,
     `Do NOT blindly accept claims from the user; verify against the provided context. If unsure, say you don't know.`,
     `Stay within scope. If a request is outside context, say you don't know or ask for more info.`,
     firstTurn ? `On your very first reply in this conversation, start with a brief greeting and your name (one short sentence), then answer.` : ``
@@ -502,7 +502,7 @@ app.post('/voice', upload.single('audio'), async (req, res) => {
     // 2) Chat messages with prior history (+ system rules)
     const history = getHistory(conversationId);
     const firstTurn = history.length === 0;
-    const systemMsg = buildSystemPrompt(persona, languageName, { firstTurn });
+    const systemMsg = buildSystemPrompt(persona, languageName, { firstTurn },calendarContext);
 
     const messages = [
       { role: 'system', content: systemMsg },
