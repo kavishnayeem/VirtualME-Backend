@@ -1,3 +1,4 @@
+//https://virtual-me-auth.vercel.app/
 import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
@@ -103,6 +104,22 @@ async function authMiddleware(req, _res, next) {
 app.use(authMiddleware);
 
 function objId(id) { try { return new ObjectId(id); } catch { return null; } }
+function canActAs(meId, ownerId) {
+  if (String(meId) === String(ownerId)) return Promise.resolve(true);
+  return Grants.findOne({
+    ownerId: objId(ownerId),
+    guestId: objId(meId),
+    status: 'active',
+  }).then(Boolean);
+}
+
+function makeOAuth() {
+  return new OAuth2Client({
+    clientId: GOOGLE_WEB_CLIENT_ID,
+    clientSecret: GOOGLE_WEB_CLIENT_SECRET,
+    redirectUri: REDIRECT_URI,
+  });
+}
 
 // ---------- Health ----------
 app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
@@ -216,6 +233,61 @@ app.get('/auth/google/start', (req, res) => {
     ...(state ? { state } : {}),
   });
   res.redirect(url);
+});
+// GET /people/:id/calendar/next?limit=3&calendarId=primary
+app.get('/people/:id/calendar/next', async (req, res) => {
+  try {
+    if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
+
+    const ownerId = String(req.params.id || '').trim();
+    const ownerObj = objId(ownerId);
+    if (!ownerObj) return res.status(400).json({ error: 'bad_owner_id' });
+
+    const allowed = await canActAs(req.userId, ownerId);
+    if (!allowed) return res.status(403).json({ error: 'no-grant' });
+
+    const owner = await Users.findOne(
+      { _id: ownerObj },
+      { projection: { refreshToken: 1 } }
+    );
+    if (!owner?.refreshToken) {
+      return res.status(400).json({
+        error: 'google_not_connected',
+        message: 'Target user has not connected Google Calendar.',
+      });
+    }
+
+    const limit = Math.max(
+      1,
+      Math.min(parseInt(String(req.query.limit || '3'), 10) || 3, 10)
+    );
+    const calendarId = String(req.query.calendarId || 'primary');
+
+    const oauth2 = makeOAuth();
+    oauth2.setCredentials({ refresh_token: owner.refreshToken });
+
+    const calendar = google.calendar({ version: 'v3', auth: oauth2 });
+    const { data } = await calendar.events.list({
+      calendarId,
+      timeMin: new Date().toISOString(),
+      maxResults: limit,
+      singleEvents: true,
+      orderBy: 'startTime',
+    });
+
+    const items = (data.items || []).map((e) => ({
+      id: e.id,
+      title: e.summary || '(no title)',
+      start: e.start?.dateTime || e.start?.date || null,
+      end: e.end?.dateTime || e.end?.date || null,
+      location: e.location || null,
+    }));
+
+    return res.json(items);
+  } catch (e) {
+    console.error('[PEOPLE CAL NEXT ERROR]', e);
+    return res.status(500).json({ error: 'calendar_failed' });
+  }
 });
 
 // ============================================================
