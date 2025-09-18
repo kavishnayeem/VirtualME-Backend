@@ -90,6 +90,26 @@ function sanitizeProfile(raw) {
   if (typeof raw.locationSharingOptIn === 'boolean') out.locationSharingOptIn = raw.locationSharingOptIn;
   return out;
 }
+// --- Add near your other helpers ---
+function pickPublicProfile(raw, { includeSensitive = false } = {}) {
+  const p = raw || {};
+  const base = {
+    character: p.character || '',
+    languages: Array.isArray(p.languages) ? p.languages.slice(0, 10) : [],
+    timeZone: p.timeZone || '',
+    availability: p.availability || '',
+    voiceStyle: p.voiceStyle || '',
+    aiPersona: p.aiPersona || '',
+    calendarPrefs: p.calendarPrefs || '',
+    // NOT including locationSharingOptIn—internal only
+  };
+  if (includeSensitive) {
+    base.homeAddress = p.homeAddress || '';
+    base.usualPlaces = Array.isArray(p.usualPlaces) ? p.usualPlaces.slice(0, 20) : [];
+  }
+  return base;
+}
+
 function signSession(userId) {
   return jwt.sign({ uid: userId }, JWT_SECRET, { expiresIn: '30d' });
 }
@@ -570,19 +590,43 @@ app.put('/me/voice-id', async (req, res) => {
     return res.status(500).json({ error: 'update_failed' });
   }
 });
-
+app.get('/me/basic', async (req, res) => {
+  if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
+  const u = await Users.findOne(
+    { _id: objId(req.userId) },
+    { projection: { name: 1, email: 1, voiceId: 1, profile: 1, picture: 1 } }
+  );
+  if (!u) return res.status(404).json({ error: 'not found' });
+  const profilePublic = pickPublicProfile(u.profile || {}, { includeSensitive: false });
+  res.json({
+    _id: u._id.toString(),
+    name: u.name,
+    email: u.email,
+    picture: u.picture || null,
+    voiceId: u.voiceId || null,
+    profilePublic,
+  });
+});
 app.get('/users/:id/basic', async (req, res) => {
   try {
     const u = await Users.findOne(
       { _id: objId(req.params.id) },
-      { projection: { name: 1, email: 1, voiceId: 1 } }
+      { projection: { name: 1, email: 1, voiceId: 1, profile: 1 } }
     );
     if (!u) return res.status(404).json({ error: 'not found' });
-    res.json({ _id: u._id.toString(), name: u.name, email: u.email, voiceId: u.voiceId || null });
+    const profilePublic = pickPublicProfile(u.profile || {}, { includeSensitive: false });
+    res.json({
+      _id: u._id.toString(),
+      name: u.name,
+      email: u.email,
+      voiceId: u.voiceId || null,
+      profilePublic,
+    });
   } catch (e) {
     res.status(500).json({ error: 'lookup failed' });
   }
 });
+
 
 // ============================================================
 // B) Devices API
