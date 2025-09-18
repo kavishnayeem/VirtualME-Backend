@@ -140,6 +140,49 @@ function makeOAuth() {
     redirectUri: REDIRECT_URI,
   });
 }
+// ---- Time helpers for "yesterday, today, tomorrow" (local tz) ----
+function pad(n){ return String(n).padStart(2,'0'); }
+
+/** Returns { startIso, endIso, labelDates } enclosing [yesterday 00:00 .. tomorrow 23:59:59.999] in given tz */
+function yttRangeISO(timeZone = 'UTC') {
+  // Build range via local components to avoid DST issues.
+  const now = new Date();
+  // Figure "today" in tz by getting its Y/M/D there:
+  const fmt = new Intl.DateTimeFormat('en-CA', { timeZone, year:'numeric', month:'2-digit', day:'2-digit' });
+  const [{ value: y },,{ value: m },,{ value: d }] = fmt.formatToParts(now);
+  const yN = Number(y), mN = Number(m), dN = Number(d);
+
+  // Build local-midnight Date objects in that tz by constructing an RFC3339 with offsetless and letting calendar API read tz param
+  // For Google API we will pass timeZone indirectly; safest is to compute UTC instants by iterating days:
+  function dateAt(y,m,d){ return new Date(Date.UTC(y, m-1, d, 0, 0, 0, 0)); }
+  const todayUTC      = dateAt(yN, mN, dN);
+  const yesterdayUTC  = new Date(todayUTC.getTime() - 24*3600*1000);
+  const tomorrowUTC   = new Date(todayUTC.getTime() + 24*3600*1000);
+
+  const startIso = new Date(yesterdayUTC).toISOString();                   // 00:00 yesterday (tz-agnostic envelope)
+  const endIso   = new Date(tomorrowUTC.getTime() + 24*3600*1000 - 1).toISOString(); // 23:59:59.999 tomorrow
+
+  // Nice labels for LLM
+  const labelDates = {
+    yesterday: `${yesterdayUTC.getUTCFullYear()}-${pad(yesterdayUTC.getUTCMonth()+1)}-${pad(yesterdayUTC.getUTCDate())}`,
+    today:     `${todayUTC.getUTCFullYear()}-${pad(todayUTC.getUTCMonth()+1)}-${pad(todayUTC.getUTCDate())}`,
+    tomorrow:  `${tomorrowUTC.getUTCFullYear()}-${pad(tomorrowUTC.getUTCMonth()+1)}-${pad(tomorrowUTC.getUTCDate())}`,
+  };
+
+  return { startIso, endIso, labelDates };
+}
+
+function simplifyEvent(e) {
+  return {
+    id: e.id,
+    title: e.summary || '(no title)',
+    start: e.start?.dateTime || e.start?.date || null,  // date = all-day
+    end:   e.end?.dateTime   || e.end?.date   || null,
+    location: e.location || null,
+    organizer: e.organizer?.email || null,
+    isAllDay: !!(e.start?.date && !e.start?.dateTime),
+  };
+}
 
 // ---------- Health ----------
 app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
@@ -261,137 +304,102 @@ app.get('/auth/google/start', (req, res) => {
   res.redirect(url);
 });
 // GET /people/:id/calendar/next?limit=3&calendarId=primary
-app.get('/people/:id/calendar/next', async (req, res) => {
+app.get('/people/:id/calendar/window', async (req, res) => {
   try {
     if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
 
-    const ownerId = String(req.params.id || '').trim();
-    const ownerObj = objId(ownerId);
-    if (!ownerObj) return res.status(400).json({ error: 'bad_owner_id' });
+    const ownerIdStr = String(req.params.id || '').trim();
+    const ownerId = objId(ownerIdStr);
+    if (!ownerId) return res.status(400).json({ error: 'bad_owner_id' });
 
-    const allowed = await canActAs(req.userId, ownerId);
+    const allowed = await canActAs(req.userId, ownerIdStr);
     if (!allowed) return res.status(403).json({ error: 'no-grant' });
-    
-    const owner = await Users.findOne(
-      { _id: ownerObj },
-      { projection: { refreshToken: 1 } }
-    );
+
+    const timeZone   = String(req.query.tz || '').trim() || 'UTC';
+    const calendarId = String(req.query.calendarId || 'primary');
+    const maxResults = Math.min(parseInt(String(req.query.max || '50'), 10) || 50, 200);
+
+    const owner = await Users.findOne({ _id: ownerId }, { projection: { refreshToken: 1 } });
     if (!owner?.refreshToken) {
-      return res.status(400).json({
-        error: 'google_not_connected',
-        message: 'Target user has not connected Google Calendar.',
-      });
+      return res.status(400).json({ error: 'google_not_connected' });
     }
 
-    const limit = Math.max(
-      1,
-      Math.min(parseInt(String(req.query.limit || '3'), 10) || 3, 10)
-    );
-    const calendarId = String(req.query.calendarId || 'primary');
+    const { startIso, endIso, labelDates } = yttRangeISO(timeZone);
 
-    const oauth2 = makeOAuth();
+    const oauth2 = new OAuth2Client({
+      clientId: GOOGLE_WEB_CLIENT_ID,
+      clientSecret: GOOGLE_WEB_CLIENT_SECRET,
+      redirectUri: REDIRECT_URI,
+    });
     oauth2.setCredentials({ refresh_token: owner.refreshToken });
 
     const calendar = google.calendar({ version: 'v3', auth: oauth2 });
     const { data } = await calendar.events.list({
       calendarId,
-      timeMin: new Date().toISOString(),
-      maxResults: limit,
+      timeMin: startIso,
+      timeMax: endIso,
+      maxResults,
       singleEvents: true,
       orderBy: 'startTime',
     });
 
-    const items = (data.items || []).map((e) => ({
-      id: e.id,
-      title: e.summary || '(no title)',
-      start: e.start?.dateTime || e.start?.date || null,
-      end: e.end?.dateTime || e.end?.date || null,
-      location: e.location || null,
-    }));
-
-    return res.json(items);
+    const items = (data.items || []).map(simplifyEvent);
+    return res.json({ range: { startIso, endIso, labelDates, timeZone }, items });
   } catch (e) {
-    // Detect the common case: insufficient scopes
-    const msg = String(e?.message || '');
-    if (e?.code === 403 && /insufficient/i.test(msg)) {
-      return res.status(400).json({
-        error: 'google_scopes_insufficient',
-        message: 'Target user must reconnect Google Calendar and grant read access.',
-      });
+    // surface insufficient scope more nicely
+    if (e?.code === 403 && /insufficient/i.test(String(e.message))) {
+      return res.status(400).json({ error: 'google_scopes_insufficient' });
     }
-    console.error('[PEOPLE CAL NEXT ERROR]', e);
+    console.error('[PEOPLE CAL WINDOW ERROR]', e);
     return res.status(500).json({ error: 'calendar_failed' });
   }
 });
+
 
 // ============================================================
 // Calendar: GET /calendar/next
 // Requires: user session (Authorization: Bearer <your JWT>)
 // Stores refreshToken in Users (already handled in /auth/callback)
 // ============================================================
-app.get('/calendar/next', async (req, res) => {
+// Requires user session (Authorization: Bearer <JWT>)
+app.get('/calendar/window', async (req, res) => {
   try {
     if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
 
-    // Fetch the current user with their Google tokens
-    const user = await Users.findOne(
-      { _id: objId(req.userId) },
-      { projection: { _id: 1, email: 1, refreshToken: 1 } }
-    );
-    if (!user) return res.status(404).json({ error: 'user_not_found' });
+    const timeZone   = String(req.query.tz || '').trim() || 'UTC'; // or use profile.timeZone if you prefer
+    const calendarId = String(req.query.calendarId || 'primary');
+    const maxResults = Math.min(parseInt(String(req.query.max || '50'), 10) || 50, 200);
 
-    // We need a refresh token from the web OAuth flow to read Calendar
-    if (!user.refreshToken) {
-      return res.status(400).json({
-        error: 'google_not_connected',
-        message:
-          'No Google refresh token on file. Reconnect via /auth/google/start to grant Calendar access.',
-      });
-    }
+    const { startIso, endIso, labelDates } = yttRangeISO(timeZone);
 
-    // Build OAuth2 client
     const oauth2Client = new OAuth2Client({
       clientId: GOOGLE_WEB_CLIENT_ID,
       clientSecret: GOOGLE_WEB_CLIENT_SECRET,
-      redirectUri: REDIRECT_URI, // must match what you used in the consent flow
+      redirectUri: REDIRECT_URI,
     });
+    const user = await Users.findOne({ _id: objId(req.userId) }, { projection: { refreshToken: 1 } });
+    if (!user?.refreshToken) return res.status(400).json({ error: 'google_not_connected' });
 
-    // Use stored refresh token; googleapis will auto-refresh access tokens
     oauth2Client.setCredentials({ refresh_token: user.refreshToken });
-
     const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
-
-    const nowIso = new Date().toISOString();
-    const calendarId = String(req.query.calendarId || 'primary');
 
     const { data } = await calendar.events.list({
       calendarId,
-      timeMin: nowIso,
-      maxResults: 1,
+      timeMin: startIso,
+      timeMax: endIso,
+      maxResults,
       singleEvents: true,
       orderBy: 'startTime',
     });
 
-    const event = (data.items && data.items[0]) || null;
-    if (!event) return res.json({ message: 'No upcoming events.' });
-
-    return res.json({
-      id: event.id,
-      summary: event.summary || '(no title)',
-      start: event.start?.dateTime || event.start?.date || null,
-      end: event.end?.dateTime || event.end?.date || null,
-      location: event.location || null,
-      hangoutLink: event.hangoutLink || null,
-      organizer: event.organizer?.email || null,
-      // include raw if you want more fields client-side:
-      // raw: event,
-    });
+    const items = (data.items || []).map(simplifyEvent);
+    return res.json({ range: { startIso, endIso, labelDates, timeZone }, items });
   } catch (e) {
-    console.error('[CALENDAR NEXT ERROR]', e);
-    // Always return JSON (never HTML), so the client can parse safely
+    console.error('[CALENDAR WINDOW ERROR]', e);
     return res.status(500).json({ error: 'calendar_failed' });
   }
 });
+
 
 
 // /auth/callback  (JS)
