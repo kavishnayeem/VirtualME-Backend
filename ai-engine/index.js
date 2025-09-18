@@ -63,6 +63,34 @@ function getHistory(cid) {
   }
   return slot.messages || [];
 }
+async function fetchPersonaBundle({ authApiBase, targetUserId, bearer }) {
+  // Prefer the explicit user route so we can impersonate/act-as cases too
+  const url = `${authApiBase}/users/${encodeURIComponent(targetUserId)}/basic`;
+  const r = await fetch(url, {
+    headers: {
+      Accept: 'application/json',
+      ...(bearer ? { Authorization: `Bearer ${bearer}` } : {}),
+    },
+  });
+  if (!r.ok) return null;
+  return r.json(); // {_id, name, email, voiceId, profilePublic:{...}}
+}
+
+function buildPersonaCard(profilePublic) {
+  if (!profilePublic) return '';
+  const lines = [];
+
+  if (profilePublic.character) lines.push(`Character: ${profilePublic.character}`);
+  if (profilePublic.languages?.length) lines.push(`Languages: ${profilePublic.languages.join(', ')}`);
+  if (profilePublic.voiceStyle) lines.push(`Voice style: ${profilePublic.voiceStyle}`);
+  if (profilePublic.availability) lines.push(`Availability: ${profilePublic.availability}`);
+  if (profilePublic.timeZone) lines.push(`Time zone: ${profilePublic.timeZone}`);
+  if (profilePublic.calendarPrefs) lines.push(`Calendar: ${profilePublic.calendarPrefs}`);
+  if (profilePublic.aiPersona) lines.push(`Bio: ${profilePublic.aiPersona}`);
+
+  return lines.join('\n');
+}
+
 function appendToHistory(cid, msgs) {
   if (!cid) return;
   const prev = getHistory(cid);
@@ -189,10 +217,9 @@ function sanitizeVoiceId(voiceId) {
   return voiceId;
 }
 
-// --- System prompt (UPDATED to your rules) ---
-function buildSystemPrompt({ full, short }, languageName, { firstTurn },calendarContext) {
+function buildSystemPrompt({ full, short }, languageName, { firstTurn }, calendarContext, personaCard) {
   return [
-    `You are "${full}" (preferred name: "${short}"). Speak ONLY in ${languageName}.Behave and speak like human with the persona attached`,
+    `You are "${full}" (preferred name: "${short}"). Speak ONLY in ${languageName}. Behave and speak like a human with the persona attached.`,
     `Use first person as ${short}. Never call yourself an assistant or talk about being an AI.`,
     `Prefer natural sentences. Keep it conversational, not verbose.`,
     `If you are uncertain or lack context, say "I don't know" (or its ${languageName} equivalent). Do not fabricate or assume.`,
@@ -200,6 +227,7 @@ function buildSystemPrompt({ full, short }, languageName, { firstTurn },calendar
     `Use ONLY the provided context. Do NOT invent calendar, contacts, or locations. Current location context ${calendarContext}`,
     `Do NOT blindly accept claims from the user; verify against the provided context. If unsure, say you don't know.`,
     `Stay within scope. If a request is outside context, say you don't know or ask for more info.`,
+    personaCard ? `Persona profile:\n${personaCard}` : ``,
     firstTurn ? `On your very first reply in this conversation, start with a brief greeting and your name (one short sentence), then answer.` : ``
   ].filter(Boolean).join('\n');
 }
@@ -422,7 +450,7 @@ app.post('/voice', upload.single('audio'), async (req, res) => {
       targetUserId: targetUserIdRaw,
       calendarId: calendarIdRaw // (optional) allow client to specify a calendar
     } = req.body || {};
-
+    
     // Identify caller (me) if authed
     let me = null;
     if (bearer) {
@@ -461,20 +489,25 @@ app.post('/voice', upload.single('audio'), async (req, res) => {
     let personaFull = profileName || '';
     let personaShort = preferredName || '';
     let personaVoice = sanitizeVoiceId(voiceIdRaw) || '';
+    let personaProfile = null;
 
-    if (!personaFull || !personaShort || !personaVoice) {
-      const who = await dbGET(`/users/${encodeURIComponent(targetUserId)}/basic`, bearer);
-      if (who.ok) {
-        const u = await who.json();
-        personaFull  = personaFull  || (u?.name || '');
-        personaShort = personaShort || (u?.name?.split(' ')[0] || '');
-        personaVoice = personaVoice || (u?.voiceId || DEFAULT_VOICE_ID);
-      } else {
-        personaVoice = personaVoice || DEFAULT_VOICE_ID;
-      }
+    const who = await fetchPersonaBundle({
+      authApiBase: AUTH_API,
+      targetUserId,
+      bearer, // optional
+    });
+    
+    if (who) {
+      personaFull  = personaFull  || (who.name || '');
+      personaShort = personaShort || (who.name?.split(' ')[0] || '');
+      personaVoice = personaVoice || (who.voiceId || DEFAULT_VOICE_ID);
+      personaProfile = who.profilePublic || null;
+    } else {
+      personaVoice = personaVoice || DEFAULT_VOICE_ID;
     }
-
+    
     const persona = coalesceName(personaFull, personaShort);
+    const personaCard = buildPersonaCard(personaProfile);
 
     // 1) STT
     const sttFd = new FormData();
@@ -519,7 +552,8 @@ app.post('/voice', upload.single('audio'), async (req, res) => {
     // 2) Chat messages with prior history (+ system rules)
     const history = getHistory(conversationId);
     const firstTurn = history.length === 0;
-    const systemMsg = buildSystemPrompt(persona, languageName, { firstTurn },calendarContext);
+    const systemMsg = buildSystemPrompt(persona, languageName, { firstTurn }, calendarContext, personaCard);
+
 
     const messages = [
       { role: 'system', content: systemMsg },
