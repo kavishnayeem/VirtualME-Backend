@@ -219,6 +219,7 @@ function sanitizeVoiceId(voiceId) {
 
 function buildSystemPrompt({ full, short }, languageName, { firstTurn }, calendarContext, personaCard) {
   return [
+    `Premise: You will be accessed if some close relative of yours cant reach you on call or text so they use this to get your updates on why cant they reach you, so use the information below to answer`,
     `You are "${full}" (preferred name: "${short}"). Speak ONLY in ${languageName}. Behave and speak like a human with the persona attached.`,
     `Use first person as ${short}. Never call yourself an assistant or talk about being an AI.`,
     `Prefer natural sentences. Keep it conversational, not verbose.`,
@@ -380,40 +381,38 @@ async function latestLocationText(userId) {
 
 // ==== CALENDAR INTEGRATION (NEW) ============================================
 // Replace your existing fetchNextCalendarEvent with this:
-async function fetchNextCalendarEvent({ bearer, calendarId = 'primary', targetUserId, myId }) {
-  if (!bearer) return null; // must be signed in to read calendars
+async function fetchCalendarWindow({ bearer, calendarId = 'primary', targetUserId, myId, timeZone }) {
+  if (!bearer) return null;
 
-  try {
-    const actingAsOther = targetUserId && myId && String(targetUserId) !== String(myId);
+  const actingAsOther = targetUserId && myId && String(targetUserId) !== String(myId);
+  const base = actingAsOther
+    ? `${AUTH_API}/people/${encodeURIComponent(targetUserId)}/calendar/window`
+    : `${AUTH_API}/calendar/window`;
 
-    // Use persona endpoint when acting as someone else; otherwise use self
-    const url = actingAsOther
-      ? `${AUTH_API}/people/${encodeURIComponent(targetUserId)}/calendar/next?limit=1&calendarId=${encodeURIComponent(calendarId)}`
-      : `${AUTH_API}/calendar/next?calendarId=${encodeURIComponent(calendarId)}`;
+  const url = `${base}?calendarId=${encodeURIComponent(calendarId)}${timeZone ? `&tz=${encodeURIComponent(timeZone)}` : ''}`;
 
-    const r = await fetch(url, {
-      headers: { Authorization: `Bearer ${bearer}`, Accept: 'application/json' },
-    });
-    if (!r.ok) return null;
-    const j = await r.json();
+  const r = await fetch(url, { headers: { Authorization: `Bearer ${bearer}`, Accept: 'application/json' } });
+  if (!r.ok) return null;
+  return r.json(); // { range:{...}, items:[...] }
+}
 
-    // Self endpoint returns a single event object; persona endpoint returns an array
-    const evt = Array.isArray(j) ? (j[0] || null) : j;
-    if (!evt) return null;
+function summarizeEventsForLLM(payload, maxItems = 8) {
+  if (!payload?.items?.length) return null;
+  const items = payload.items.slice(0, maxItems);
 
-    const title = evt.title || evt.summary || '(no title)';
-    const startIso = evt.start || null;
-    const endIso   = evt.end || null;
-    if (!startIso) return null;
-
-    const whenTxt  = endIso ? `${startIso} → ${endIso}` : startIso;
-    const whereTxt = evt.location ? ` at ${evt.location}` : '';
-    const orgTxt   = evt.organizer ? ` (organizer: ${evt.organizer})` : ''; // may be missing on persona route
-
-    return `Next calendar event: "${title}"${whereTxt}, ${whenTxt}${orgTxt}.`;
-  } catch {
-    return null;
+  const lines = [];
+  for (const e of items) {
+    const when = e.start || '(no start)';
+    const where = e.location ? ` @ ${e.location}` : '';
+    const tag   = e.isAllDay ? ' (all-day)' : '';
+    lines.push(`• ${when}: "${e.title}"${where}${tag}`);
   }
+
+  return [
+    `Calendar (tz=${payload.range?.timeZone || 'n/a'})`,
+    `Window: ${payload.range?.labelDates?.yesterday} → ${payload.range?.labelDates?.tomorrow}`,
+    ...lines
+  ].join('\n');
 }
 
 
@@ -538,15 +537,21 @@ app.post('/voice', upload.single('audio'), async (req, res) => {
 
     // ==== Calendar context (NEW) =========================================
     // We proactively fetch it when authed; model will use it only if relevant.
+    // ==== Calendar context (YTT window) ==================================
     let calendarContext = null;
     if (bearer) {
-      calendarContext = await fetchNextCalendarEvent({
+      // If you have user's tz in DB, you can pass it here (e.g., me.profile?.timeZone)
+      const timeZone = null; // or a string like 'America/Chicago'
+      const windowPayload = await fetchCalendarWindow({
         bearer,
         calendarId: calendarIdRaw || 'primary',
         targetUserId,
         myId,
+        timeZone,
       });
+      calendarContext = summarizeEventsForLLM(windowPayload, 8);
     }
+
     // =====================================================================
 
     // 2) Chat messages with prior history (+ system rules)
