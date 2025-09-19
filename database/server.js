@@ -1,4 +1,4 @@
-//https://virtual-me-auth.vercel.app/
+// https://virtual-me-auth.vercel.app/
 import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
@@ -37,7 +37,6 @@ app.use(cookieParser());
 app.use(
   cors({
     origin: true,
-    
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization','X-Dev-Key','X-Requested-With'],
     credentials: false,
@@ -90,7 +89,6 @@ function sanitizeProfile(raw) {
   if (typeof raw.locationSharingOptIn === 'boolean') out.locationSharingOptIn = raw.locationSharingOptIn;
   return out;
 }
-// --- Add near your other helpers ---
 function pickPublicProfile(raw, { includeSensitive = false } = {}) {
   const p = raw || {};
   const base = {
@@ -101,7 +99,6 @@ function pickPublicProfile(raw, { includeSensitive = false } = {}) {
     voiceStyle: p.voiceStyle || '',
     aiPersona: p.aiPersona || '',
     calendarPrefs: p.calendarPrefs || '',
-    // NOT including locationSharingOptIn—internal only
   };
   if (includeSensitive) {
     base.homeAddress = p.homeAddress || '';
@@ -133,43 +130,53 @@ function canActAs(meId, ownerId) {
   }).then(Boolean);
 }
 
-function makeOAuth() {
-  return new OAuth2Client({
-    clientId: GOOGLE_WEB_CLIENT_ID,
-    clientSecret: GOOGLE_WEB_CLIENT_SECRET,
-    redirectUri: REDIRECT_URI,
-  });
-}
-// ---- Time helpers for "yesterday, today, tomorrow" (local tz) ----
-function pad(n){ return String(n).padStart(2,'0'); }
+// ---------- Time helpers ----------
 
-/** Returns { startIso, endIso, labelDates } enclosing [yesterday 00:00 .. tomorrow 23:59:59.999] in given tz */
+// Existing YTT (kept for backward compatibility)
+function pad(n){ return String(n).padStart(2,'0'); }
 function yttRangeISO(timeZone = 'UTC') {
-  // Build range via local components to avoid DST issues.
   const now = new Date();
-  // Figure "today" in tz by getting its Y/M/D there:
   const fmt = new Intl.DateTimeFormat('en-CA', { timeZone, year:'numeric', month:'2-digit', day:'2-digit' });
   const [{ value: y },,{ value: m },,{ value: d }] = fmt.formatToParts(now);
   const yN = Number(y), mN = Number(m), dN = Number(d);
-
-  // Build local-midnight Date objects in that tz by constructing an RFC3339 with offsetless and letting calendar API read tz param
-  // For Google API we will pass timeZone indirectly; safest is to compute UTC instants by iterating days:
   function dateAt(y,m,d){ return new Date(Date.UTC(y, m-1, d, 0, 0, 0, 0)); }
   const todayUTC      = dateAt(yN, mN, dN);
   const yesterdayUTC  = new Date(todayUTC.getTime() - 24*3600*1000);
   const tomorrowUTC   = new Date(todayUTC.getTime() + 24*3600*1000);
-
-  const startIso = new Date(yesterdayUTC).toISOString();                   // 00:00 yesterday (tz-agnostic envelope)
-  const endIso   = new Date(tomorrowUTC.getTime() + 24*3600*1000 - 1).toISOString(); // 23:59:59.999 tomorrow
-
-  // Nice labels for LLM
+  const startIso = new Date(yesterdayUTC).toISOString();
+  const endIso   = new Date(tomorrowUTC.getTime() + 24*3600*1000 - 1).toISOString();
   const labelDates = {
     yesterday: `${yesterdayUTC.getUTCFullYear()}-${pad(yesterdayUTC.getUTCMonth()+1)}-${pad(yesterdayUTC.getUTCDate())}`,
     today:     `${todayUTC.getUTCFullYear()}-${pad(todayUTC.getUTCMonth()+1)}-${pad(todayUTC.getUTCDate())}`,
     tomorrow:  `${tomorrowUTC.getUTCFullYear()}-${pad(tomorrowUTC.getUTCMonth()+1)}-${pad(tomorrowUTC.getUTCDate())}`,
   };
-
   return { startIso, endIso, labelDates };
+}
+
+// New Forward-window helpers
+const CAL_GRACE_MIN = Number(process.env.CAL_GRACE_MIN || 5);   // include meetings ending within last N minutes
+const CAL_BACK_BUFFER_HOURS = Number(process.env.CAL_BACK_BUFFER_HOURS || 12); // to capture long running meetings
+const CAL_FORWARD_HOURS = Number(process.env.CAL_FORWARD_HOURS || 48);         // now → +48h
+
+function ymdInTz(d, timeZone) {
+  const parts = new Intl.DateTimeFormat('en-CA', { timeZone, year:'numeric', month:'2-digit', day:'2-digit' })
+    .formatToParts(d);
+  const y = parts.find(p => p.type === 'year')?.value;
+  const m = parts.find(p => p.type === 'month')?.value;
+  const dd = parts.find(p => p.type === 'day')?.value;
+  return `${y}-${m}-${dd}`;
+}
+function labelDatesForTodayAndTomorrow(timeZone) {
+  const now = new Date();
+  const today = ymdInTz(now, timeZone);
+  const tomorrow = ymdInTz(new Date(now.getTime() + 24*3600*1000), timeZone);
+  return { today, tomorrow };
+}
+function forwardBoundsISO() {
+  const now = Date.now();
+  const timeMin = new Date(now - CAL_BACK_BUFFER_HOURS*3600*1000).toISOString();
+  const timeMax = new Date(now + CAL_FORWARD_HOURS*3600*1000).toISOString();
+  return { timeMin, timeMax };
 }
 
 function simplifyEvent(e) {
@@ -184,6 +191,24 @@ function simplifyEvent(e) {
   };
 }
 
+// Keep events that are ongoing now (end >= now - grace) OR that start today/tomorrow in TZ
+function keepForward(e, timeZone, labels, now = new Date()) {
+  const nowMinusGrace = new Date(now.getTime() - CAL_GRACE_MIN*60*1000);
+
+  if (e.isAllDay) {
+    const startDay = e.start ? ymdInTz(new Date(e.start + 'T00:00:00Z'), timeZone) : '';
+    return startDay === labels.today || startDay === labels.tomorrow;
+  }
+
+  const end = e.end ? new Date(e.end) : null;
+  const ongoing = end && end >= nowMinusGrace;
+
+  const startDay = e.start ? ymdInTz(new Date(e.start), timeZone) : '';
+  const startsTodayOrTomorrow = startDay === labels.today || startDay === labels.tomorrow;
+
+  return Boolean(ongoing || startsTodayOrTomorrow);
+}
+
 // ---------- Health ----------
 app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
 app.get('/', (_req, res) => res.send('OK'));
@@ -191,19 +216,16 @@ app.get('/', (_req, res) => res.send('OK'));
 // ============================================================
 // A) MOBILE/WEB AUTH
 // ============================================================
-// server.js (excerpt)
-// server.js (excerpt)
 app.post('/auth/google/native', async (req, res) => {
   try {
     const { idToken } = req.body || {};
     if (!idToken) return res.status(400).json({ error: 'missing idToken' });
 
-    // ✅ Use your WEB client ID here (NOT the Android client)
     const { GOOGLE_WEB_CLIENT_ID } = process.env;
 
     const ticket = await oauthVerify.verifyIdToken({
       idToken,
-      audience: GOOGLE_WEB_CLIENT_ID, // must match the webClientId you configured on the app
+      audience: GOOGLE_WEB_CLIENT_ID,
     });
 
     const p = ticket.getPayload();
@@ -226,7 +248,7 @@ app.post('/auth/google/native', async (req, res) => {
     const doc = await Users.findOne({ googleId: p.sub }, { projection: { _id: 1, name: 1, email: 1, picture: 1 } });
     if (!doc) return res.status(500).json({ error: 'user upsert failed' });
 
-    const token = signSession(doc._id.toString()); // your JWT
+    const token = signSession(doc._id.toString());
     const userPayload = { _id: doc._id, name: doc.name, email: doc.email, picture: doc.picture };
 
     return res.json({ token, user: userPayload });
@@ -236,8 +258,7 @@ app.post('/auth/google/native', async (req, res) => {
   }
 });
 
-
-// NEW: /auth/dev-impersonate  (DEV ONLY)
+// DEV impersonation
 app.post('/auth/dev-impersonate', async (req, res) => {
   try {
     const DEV_KEY = process.env.DEV_IMPERSONATE_KEY;
@@ -256,10 +277,8 @@ app.post('/auth/dev-impersonate', async (req, res) => {
     const token = signSession(doc._id.toString());
     const userPayload = { _id: doc._id, name: doc.name, email: doc.email, picture: doc.picture };
 
-    // default: JSON (simple)
     if (!('popup' in req.query)) return res.json({ token, user: userPayload });
 
-    // optional: popup helper that posts window message like your Google flow
     const targetOrigin = process.env.WEB_ORIGIN || '*';
     return res
       .set('Content-Type', 'text/html')
@@ -279,31 +298,53 @@ app.post('/auth/dev-impersonate', async (req, res) => {
 
 app.get('/auth/google/start', (req, res) => {
   if (!oauthWeb) return res.status(500).send('Server not configured for web OAuth flow');
-  const scopes = [
-    'openid', 'email', 'profile',
-    'https://www.googleapis.com/auth/calendar.readonly',
-  ];
+
   const { app_redirect } = req.query;
   const state = app_redirect
     ? Buffer.from(JSON.stringify({ app_redirect })).toString('base64url')
     : undefined;
 
-    const url = oauthWeb.generateAuthUrl({
-      access_type: 'offline',
-      prompt: 'consent',               // force the consent screen
-      include_granted_scopes: true,    // incremental auth (keeps previous grants)
-      scope: [
-        'openid',
-        'email',
-        'profile',
-        'https://www.googleapis.com/auth/calendar.readonly',
-        // (optional) 'https://www.googleapis.com/auth/calendar.events.readonly'
-      ],
-      redirect_uri: REDIRECT_URI,
-    });
+  const url = oauthWeb.generateAuthUrl({
+    access_type: 'offline',
+    prompt: 'consent',
+    include_granted_scopes: true,
+    scope: [
+      'openid',
+      'email',
+      'profile',
+      'https://www.googleapis.com/auth/calendar.readonly',
+    ],
+    redirect_uri: REDIRECT_URI,
+  });
   res.redirect(url);
 });
-// GET /people/:id/calendar/window?limit=3&calendarId=primary
+
+// ============================================================
+// Calendar: PEOPLE (impersonation) & SELF
+// ============================================================
+
+// Common Google call -> returns {items}
+async function listEvents({ refreshToken, calendarId, timeMin, timeMax, timeZone, maxResults }) {
+  const oauth2 = new OAuth2Client({
+    clientId: GOOGLE_WEB_CLIENT_ID,
+    clientSecret: GOOGLE_WEB_CLIENT_SECRET,
+    redirectUri: REDIRECT_URI,
+  });
+  oauth2.setCredentials({ refresh_token: refreshToken });
+  const calendar = google.calendar({ version: 'v3', auth: oauth2 });
+  const { data } = await calendar.events.list({
+    calendarId,
+    timeMin,
+    timeMax,
+    maxResults,
+    singleEvents: true,
+    orderBy: 'startTime',
+    timeZone,
+  });
+  return data?.items || [];
+}
+
+// GET /people/:id/calendar/window
 app.get('/people/:id/calendar/window', async (req, res) => {
   try {
     if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
@@ -318,35 +359,33 @@ app.get('/people/:id/calendar/window', async (req, res) => {
     const timeZone   = String(req.query.tz || '').trim() || 'UTC';
     const calendarId = String(req.query.calendarId || 'primary');
     const maxResults = Math.min(parseInt(String(req.query.max || '50'), 10) || 50, 200);
+    const mode       = String(req.query.mode || '').trim(); // '' | 'forward'
 
     const owner = await Users.findOne({ _id: ownerId }, { projection: { refreshToken: 1 } });
-    if (!owner?.refreshToken) {
-      return res.status(400).json({ error: 'google_not_connected' });
+    if (!owner?.refreshToken) return res.status(400).json({ error: 'google_not_connected' });
+
+    let labels, timeMin, timeMax, legacy;
+    if (mode === 'forward') {
+      labels = labelDatesForTodayAndTomorrow(timeZone);
+      ({ timeMin, timeMax } = forwardBoundsISO());
+    } else {
+      legacy = yttRangeISO(timeZone);
+      timeMin = legacy.startIso; timeMax = legacy.endIso;
     }
 
-    const { startIso, endIso, labelDates } = yttRangeISO(timeZone);
+    const raw = await listEvents({ refreshToken: owner.refreshToken, calendarId, timeMin, timeMax, timeZone, maxResults });
+    const simplified = raw.map(simplifyEvent);
+    const items = (mode === 'forward')
+      ? simplified.filter(e => keepForward(e, timeZone, labels))
+      : simplified;
 
-    const oauth2 = new OAuth2Client({
-      clientId: GOOGLE_WEB_CLIENT_ID,
-      clientSecret: GOOGLE_WEB_CLIENT_SECRET,
-      redirectUri: REDIRECT_URI,
+    return res.json({
+      range: (mode === 'forward')
+        ? { mode: 'forward', timeZone, labelDates: labels }
+        : { mode: 'ytt', timeZone, ...legacy },
+      items,
     });
-    oauth2.setCredentials({ refresh_token: owner.refreshToken });
-
-    const calendar = google.calendar({ version: 'v3', auth: oauth2 });
-    const { data } = await calendar.events.list({
-      calendarId,
-      timeMin: startIso,
-      timeMax: endIso,
-      maxResults,
-      singleEvents: true,
-      orderBy: 'startTime',
-    });
-
-    const items = (data.items || []).map(simplifyEvent);
-    return res.json({ range: { startIso, endIso, labelDates, timeZone }, items });
   } catch (e) {
-    // surface insufficient scope more nicely
     if (e?.code === 403 && /insufficient/i.test(String(e.message))) {
       return res.status(400).json({ error: 'google_scopes_insufficient' });
     }
@@ -355,55 +394,49 @@ app.get('/people/:id/calendar/window', async (req, res) => {
   }
 });
 
-
-// ============================================================
-// Calendar: GET /calendar/window
-// Requires: user session (Authorization: Bearer <your JWT>)
-// Stores refreshToken in Users (already handled in /auth/callback)
-// ============================================================
-// Requires user session (Authorization: Bearer <JWT>)
+// GET /calendar/window  (self)
 app.get('/calendar/window', async (req, res) => {
   try {
     if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
 
-    const timeZone   = String(req.query.tz || '').trim() || 'UTC'; // or use profile.timeZone if you prefer
+    const timeZone   = String(req.query.tz || '').trim() || 'UTC';
     const calendarId = String(req.query.calendarId || 'primary');
     const maxResults = Math.min(parseInt(String(req.query.max || '50'), 10) || 50, 200);
+    const mode       = String(req.query.mode || '').trim(); // '' | 'forward'
 
-    const { startIso, endIso, labelDates } = yttRangeISO(timeZone);
-
-    const oauth2Client = new OAuth2Client({
-      clientId: GOOGLE_WEB_CLIENT_ID,
-      clientSecret: GOOGLE_WEB_CLIENT_SECRET,
-      redirectUri: REDIRECT_URI,
-    });
     const user = await Users.findOne({ _id: objId(req.userId) }, { projection: { refreshToken: 1 } });
     if (!user?.refreshToken) return res.status(400).json({ error: 'google_not_connected' });
 
-    oauth2Client.setCredentials({ refresh_token: user.refreshToken });
-    const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
+    let labels, timeMin, timeMax, legacy;
+    if (mode === 'forward') {
+      labels = labelDatesForTodayAndTomorrow(timeZone);
+      ({ timeMin, timeMax } = forwardBoundsISO());
+    } else {
+      legacy = yttRangeISO(timeZone);
+      timeMin = legacy.startIso; timeMax = legacy.endIso;
+    }
 
-    const { data } = await calendar.events.list({
-      calendarId,
-      timeMin: startIso,
-      timeMax: endIso,
-      maxResults,
-      singleEvents: true,
-      orderBy: 'startTime',
+    const raw = await listEvents({ refreshToken: user.refreshToken, calendarId, timeMin, timeMax, timeZone, maxResults });
+    const simplified = raw.map(simplifyEvent);
+    const items = (mode === 'forward')
+      ? simplified.filter(e => keepForward(e, timeZone, labels))
+      : simplified;
+
+    return res.json({
+      range: (mode === 'forward')
+        ? { mode: 'forward', timeZone, labelDates: labels }
+        : { mode: 'ytt', timeZone, ...legacy },
+      items,
     });
-
-    const items = (data.items || []).map(simplifyEvent);
-    console.log(items);
-    return res.json({ range: { startIso, endIso, labelDates, timeZone }, items });
   } catch (e) {
     console.error('[CALENDAR WINDOW ERROR]', e);
     return res.status(500).json({ error: 'calendar_failed' });
   }
 });
 
-
-
-// /auth/callback  (JS)
+// ============================================================
+// OAuth callback
+// ============================================================
 app.get('/auth/callback', async (req, res) => {
   try {
     if (!oauthWeb) return res.status(500).send('Server not configured for web OAuth flow');
@@ -411,18 +444,15 @@ app.get('/auth/callback', async (req, res) => {
     const { code, state } = req.query;
     if (!code) return res.status(400).send('Missing code');
 
-    // Exchange code -> tokens
     const { tokens } = await oauthWeb.getToken({ code, redirect_uri: REDIRECT_URI });
     if (!tokens.id_token) return res.status(400).send('No id_token');
 
-    // Verify id_token
     const ticket = await oauthVerify.verifyIdToken({
       idToken: tokens.id_token,
       audience: GOOGLE_WEB_CLIENT_ID,
     });
     const p = ticket.getPayload();
 
-    // Upsert user
     const update = {
       googleId: p.sub,
       email: p.email,
@@ -440,19 +470,7 @@ app.get('/auth/callback', async (req, res) => {
         $set: update,
         $setOnInsert: {
           createdAt: new Date(),
-          // make sure shape exists for new users
-          profile: {
-            character: '',
-            homeAddress: '',
-            usualPlaces: [],
-            languages: [],
-            timeZone: '',
-            availability: '',
-            voiceStyle: '',
-            aiPersona: '',
-            calendarPrefs: '',
-            locationSharingOptIn: false,
-          },
+          profile: { ...EMPTY_PROFILE },
           lobby: { granted: [], invites: [] },
         },
       },
@@ -462,31 +480,17 @@ app.get('/auth/callback', async (req, res) => {
     const doc = await Users.findOne({ googleId: p.sub });
     if (!doc) return res.status(500).send('User upsert failed');
 
-    // backfill if missing
     const patch = {};
-    if (!doc.profile) patch.profile = {
-      character: '',
-      homeAddress: '',
-      usualPlaces: [],
-      languages: [],
-      timeZone: '',
-      availability: '',
-      voiceStyle: '',
-      aiPersona: '',
-      calendarPrefs: '',
-      locationSharingOptIn: false,
-    };
+    if (!doc.profile) patch.profile = { ...EMPTY_PROFILE };
     if (!doc.lobby) patch.lobby = { granted: [], invites: [] };
     if (Object.keys(patch).length) {
       await Users.updateOne({ _id: doc._id }, { $set: patch });
       Object.assign(doc, patch);
     }
 
-    // Create app session token
     const token = signSession(doc._id.toString());
     const userPayload = { name: doc.name, email: doc.email, picture: doc.picture, _id: doc._id };
 
-    // state may contain app_redirect
     let app_redirect;
     if (state) {
       try {
@@ -498,14 +502,12 @@ app.get('/auth/callback', async (req, res) => {
     if (app_redirect) {
       const b64 = Buffer.from(JSON.stringify({ token, user: userPayload })).toString('base64');
 
-      // ✅ Treat both new and old Expo proxy domains as “proxy mode”
       const isExpoProxy =
         app_redirect.includes('auth.expo.dev') ||
         app_redirect.includes('auth.expo.io') ||
         app_redirect.includes('expo-auth-session');
 
       if (isExpoProxy) {
-        // Expo proxy expects fragment, not query
         const redirectUrl = `${app_redirect}#vm=${encodeURIComponent(b64)}`;
         return res
           .set('Content-Type', 'text/html')
@@ -519,12 +521,10 @@ app.get('/auth/callback', async (req, res) => {
 <p>Redirecting back to the app…</p>`);
       }
 
-      // Standalone/dev-client: deep link directly
       const sep = app_redirect.includes('?') ? '&' : '?';
       return res.redirect(`${app_redirect}${sep}vm=${encodeURIComponent(b64)}`);
     }
 
-    // Web popup fallback
     const targetOrigin = WEB_ORIGIN || '*';
     return res
       .set('Content-Type', 'text/html')
@@ -542,8 +542,6 @@ app.get('/auth/callback', async (req, res) => {
     return res.status(500).send('OAuth callback failed: ' + e.message);
   }
 });
-
-
 
 // ---------- Me / Profile ----------
 app.get('/me', async (req, res) => {
@@ -580,7 +578,6 @@ app.put('/me', async (req, res) => {
   }
 });
 
-// Update Voice Id
 app.put('/me/voice-id', async (req, res) => {
   try {
     if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
@@ -599,13 +596,14 @@ app.put('/me/voice-id', async (req, res) => {
     return res.status(500).json({ error: 'update_failed' });
   }
 });
+
 app.get('/me/basic', async (req, res) => {
   if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
   const u = await Users.findOne(
     { _id: objId(req.userId) },
     { projection: { name: 1, email: 1, voiceId: 1, profile: 1, picture: 1 } }
   );
-  if (!u) return res.status(404).json({ error: 'not found' });
+  if (!u) return res.status(404).json({ error: 'not_found' });
   const profilePublic = pickPublicProfile(u.profile || {}, { includeSensitive: false });
   res.json({
     _id: u._id.toString(),
@@ -616,6 +614,7 @@ app.get('/me/basic', async (req, res) => {
     profilePublic,
   });
 });
+
 app.get('/users/:id/basic', async (req, res) => {
   try {
     const u = await Users.findOne(
@@ -636,15 +635,11 @@ app.get('/users/:id/basic', async (req, res) => {
   }
 });
 
-
 // ============================================================
-// B) Devices API
+// Devices API (register/share/touch)
 // ============================================================
-
-// Ensure a unique index on device id (safe to call once at boot)
 await Devices.createIndex({ id: 1 }, { unique: true }).catch(() => {});
 
-// GET /devices/:id  -> 200 { id, ownerId, label, platform, model, sharing, lastSeenAt }
 app.get('/devices/:id', async (req, res) => {
   try {
     if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
@@ -655,7 +650,6 @@ app.get('/devices/:id', async (req, res) => {
     const dev = await Devices.findOne({ id });
     if (!dev) return res.status(404).json({ error: 'not_found' });
 
-    // Only owner can read their device
     if (String(dev.ownerId) !== String(req.userId)) {
       return res.status(403).json({ error: 'forbidden' });
     }
@@ -675,7 +669,6 @@ app.get('/devices/:id', async (req, res) => {
   }
 });
 
-// POST /devices/register  body: { id, label?, platform?, model? }
 app.post('/devices/register', async (req, res) => {
   try {
     if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
@@ -688,7 +681,6 @@ app.post('/devices/register', async (req, res) => {
 
     const existing = await Devices.findOne({ id });
 
-    // If device already exists under someone else, block
     if (existing && String(existing.ownerId) !== String(ownerId)) {
       return res.status(409).json({ error: 'device_owned_by_another_account' });
     }
@@ -699,7 +691,7 @@ app.post('/devices/register', async (req, res) => {
       label: typeof label === 'string' ? label : (existing?.label || null),
       platform: typeof platform === 'string' ? platform : (existing?.platform || null),
       model: typeof model === 'string' ? model : (existing?.model || null),
-      sharing: existing?.sharing === true,  // default false unless previously enabled
+      sharing: existing?.sharing === true,
       lastSeenAt: existing?.lastSeenAt || null,
       updatedAt: now,
       createdAt: existing?.createdAt || now,
@@ -718,7 +710,6 @@ app.post('/devices/register', async (req, res) => {
     });
   } catch (e) {
     console.error('[DEVICES REGISTER ERROR]', e);
-    // duplicate key (race) -> 409
     if (String(e?.code) === '11000') {
       return res.status(409).json({ error: 'duplicate_device' });
     }
@@ -726,7 +717,6 @@ app.post('/devices/register', async (req, res) => {
   }
 });
 
-// POST /devices/:id/sharing  body: { sharing: boolean }
 app.post('/devices/:id/sharing', async (req, res) => {
   try {
     if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
@@ -756,7 +746,6 @@ app.post('/devices/:id/sharing', async (req, res) => {
   }
 });
 
-// POST /devices/:id/touch  body: { lastSeenAt: number }
 app.post('/devices/:id/touch', async (req, res) => {
   try {
     if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
@@ -777,15 +766,13 @@ app.post('/devices/:id/touch', async (req, res) => {
   }
 });
 
-
 // ============================================================
-// C) Lobby / Grants (invite, accept, reject, revoke, list, requests, ACL)
+// Lobby / Grants
 // ============================================================
 function genInviteCode() {
   return `INV-${Math.random().toString(36).slice(2, 6).toUpperCase()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
 }
 
-// Summary: granted (outbound active + outbound pending) and received (active)
 app.get('/lobby/summary', async (req, res) => {
   try {
     if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
@@ -826,7 +813,6 @@ app.get('/lobby/summary', async (req, res) => {
 
     const granted = [...activeGrants, ...pendingAsGrants];
 
-    // Received ACTIVE grants (other owners who granted ME access)
     const myIdStr = meDoc._id.toString();
     const owners = await Users.find(
       { 'lobby.granted': { $elemMatch: { 'guest._id': myIdStr, status: 'active' } } },
@@ -864,8 +850,6 @@ app.get('/lobby/summary', async (req, res) => {
   }
 });
 
-// INCOMING invite requests (pending invites that target my email)
-// --- replace your current /lobby/requests handler with this ---
 app.get('/lobby/requests', async (req, res) => {
   try {
     if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
@@ -877,13 +861,12 @@ app.get('/lobby/requests', async (req, res) => {
 
     const meEmail = (me.email || '').toLowerCase();
 
-    // A) Gather pending requests from Users.lobby.invites
     const ownerCursor = Users.find(
       { 'lobby.invites': { $elemMatch: { email: meEmail, status: 'pending' } } },
       { projection: { _id: 1, name: 1, email: 1, picture: 1, lobby: 1 } }
     );
 
-    const byKey = new Map(); // key: inviteCode || `${ownerId}:${meEmail}`
+    const byKey = new Map();
 
     for await (const owner of ownerCursor) {
       const invites = Array.isArray(owner.lobby?.invites) ? owner.lobby.invites : [];
@@ -904,43 +887,38 @@ app.get('/lobby/requests', async (req, res) => {
       }
     }
 
-    // B) Gather pending requests from Grants (guestId=me, status=pending)
     const grantPend = await Grants
-    .find({ guestId: me._id, status: 'pending' }, { projection: { ownerId: 1, inviteCode: 1, createdAt: 1 } })
-    .toArray();
-  
-  const ownerIds = [...new Set(grantPend.map(g => g.ownerId).filter(Boolean))];
-  const owners = ownerIds.length
-    ? await Users.find(
-        { _id: { $in: ownerIds } },
-        { projection: { _id: 1, name: 1, email: 1, picture: 1 } }
-      ).toArray()
-    : [];
-  const ownerMap = new Map(owners.map(o => [o._id.toString(), o]));
-  
-  for (const g of grantPend) {
-    const owner = ownerMap.get(g.ownerId.toString());
-    if (!owner) continue;
-  
-    // ⬇️ synthesize a deterministic code when Grants row lacks inviteCode
-    const synthetic = `GRANT-${owner._id.toString()}-${me._id.toString()}`;
-    const code = g.inviteCode || synthetic;
-  
-    if (!byKey.has(code)) {
-      byKey.set(code, {
-        inviteCode: code, // <— always defined now
-        createdAt: g.createdAt ? new Date(g.createdAt).toISOString() : undefined,
-        owner: {
-          _id: owner._id.toString(),
-          name: owner.name,
-          email: owner.email,
-          picture: owner.picture,
-        },
-      });
-    }
-  }
+      .find({ guestId: me._id, status: 'pending' }, { projection: { ownerId: 1, inviteCode: 1, createdAt: 1 } })
+      .toArray();
 
-    // optional: sort newest first
+    const ownerIds = [...new Set(grantPend.map(g => g.ownerId).filter(Boolean))];
+    const owners = ownerIds.length
+      ? await Users.find(
+          { _id: { $in: ownerIds } },
+          { projection: { _id: 1, name: 1, email: 1, picture: 1 } }
+        ).toArray()
+      : [];
+    const ownerMap = new Map(owners.map(o => [o._id.toString(), o]));
+  
+    for (const g of grantPend) {
+      const owner = ownerMap.get(g.ownerId.toString());
+      if (!owner) continue;
+      const synthetic = `GRANT-${owner._id.toString()}-${me._id.toString()}`;
+      const code = g.inviteCode || synthetic;
+      if (!byKey.has(code)) {
+        byKey.set(code, {
+          inviteCode: code,
+          createdAt: g.createdAt ? new Date(g.createdAt).toISOString() : undefined,
+          owner: {
+            _id: owner._id.toString(),
+            name: owner.name,
+            email: owner.email,
+            picture: owner.picture,
+          },
+        });
+      }
+    }
+
     const requests = Array.from(byKey.values()).sort((a, b) => {
       const ta = a.createdAt ? Date.parse(a.createdAt) : 0;
       const tb = b.createdAt ? Date.parse(b.createdAt) : 0;
@@ -954,8 +932,6 @@ app.get('/lobby/requests', async (req, res) => {
   }
 });
 
-
-// Invite (owner -> guest email)
 app.post('/lobby/invite', async (req, res) => {
   try {
     if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
@@ -967,13 +943,11 @@ app.post('/lobby/invite', async (req, res) => {
     const now = new Date();
     const inviteCode = genInviteCode();
 
-    // Remove any existing pending invite for same email
     await Users.updateOne(
       { _id: ownerId },
       { $pull: { 'lobby.invites': { email: normEmail, status: 'pending' } } }
     );
 
-    // Push new invite
     await Users.updateOne(
       { _id: ownerId },
       {
@@ -988,7 +962,6 @@ app.post('/lobby/invite', async (req, res) => {
       }
     );
 
-    // Mirror into Grants if guest exists
     const guest = await Users.findOne({ email: normEmail }, { projection: { _id: 1 } });
     if (guest) {
       const existing = await Grants.findOne({ ownerId, guestId: guest._id });
@@ -1016,8 +989,6 @@ app.post('/lobby/invite', async (req, res) => {
   }
 });
 
-
-// --- modify your /lobby/accept handler: add the GRANTS fallback block ---
 app.post('/lobby/accept', async (req, res) => {
   try {
     if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
@@ -1030,14 +1001,11 @@ app.post('/lobby/accept', async (req, res) => {
     );
     if (!guest) return res.status(404).json({ error: 'guest_not_found' });
     
-    // Try owner via embedded invite first (existing code)...
     let owner = await Users.findOne(
       { 'lobby.invites': { $elemMatch: { inviteCode, status: 'pending' } } },
       { projection: { _id: 1, email: 1, name: 1, picture: 1, lobby: 1 } }
     );
-    
 
-    // B) If not found, resolve via Grants (guestId=me, inviteCode pending)
     if (!owner && inviteCode.startsWith('GRANT-')) {
       const parts = inviteCode.split('-'); // ["GRANT", "<ownerId>", "<guestId>"]
       if (parts.length === 3) {
@@ -1057,13 +1025,11 @@ app.post('/lobby/accept', async (req, res) => {
     
     if (!owner) return res.status(404).json({ error: 'invite_not_found' });
 
-    // Remove invite if it exists on owner doc
     await Users.updateOne(
       { _id: owner._id },
       { $pull: { 'lobby.invites': { inviteCode } } }
     );
 
-    // Promote to active grant
     const grantId = `grant_${owner._id}_${guest._id}_${Date.now()}`;
     const now = new Date();
 
@@ -1100,16 +1066,12 @@ app.post('/lobby/accept', async (req, res) => {
   }
 });
 
-
-// Reject (guest rejects an incoming invite by inviteCode)
-// --- modify your /lobby/reject handler similarly ---
 app.post('/lobby/reject', async (req, res) => {
   try {
     if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
     const { inviteCode } = req.body || {};
     if (!inviteCode) return res.status(400).json({ error: 'invalid_code' });
 
-    // Try owner doc first
     let owner = await Users.findOne(
       { 'lobby.invites': { $elemMatch: { inviteCode, status: 'pending' } } },
       { projection: { _id: 1 } }
@@ -1127,7 +1089,6 @@ app.post('/lobby/reject', async (req, res) => {
       return res.json({ ok: true });
     }
 
-    // Fallback via Grants
     const meId = objId(req.userId);
     const pendGrant = await Grants.findOne({ guestId: meId, inviteCode, status: 'pending' });
     if (!pendGrant) return res.status(404).json({ error: 'invite_not_found' });
@@ -1136,7 +1097,7 @@ app.post('/lobby/reject', async (req, res) => {
       { _id: pendGrant._id },
       { $set: { status: 'revoked', updatedAt: new Date() } }
     );
-    // Attempt to remove any stale embedded invite as well
+
     await Users.updateOne(
       { _id: pendGrant.ownerId },
       { $pull: { 'lobby.invites': { inviteCode } } }
@@ -1149,8 +1110,6 @@ app.post('/lobby/reject', async (req, res) => {
   }
 });
 
-
-// Revoke (owner revokes a pending invite OR an active grant)
 app.post('/lobby/revoke', async (req, res) => {
   try {
     if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
@@ -1188,7 +1147,6 @@ app.post('/lobby/revoke', async (req, res) => {
   }
 });
 
-// Revoke by guestId (lets UI pass guest._id)
 app.post('/lobby/revoke-by-guest', async (req, res) => {
   try {
     if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
@@ -1211,8 +1169,7 @@ app.post('/lobby/revoke-by-guest', async (req, res) => {
   }
 });
 
-// Simple ACL check used by voice-agent
-// GET /acl/can-act-as?target=<userId>
+// Simple ACL check
 app.get('/acl/can-act-as', async (req, res) => {
   try {
     if (!req.userId) return res.status(401).json({ allowed: false, reason: 'unauthorized' });
