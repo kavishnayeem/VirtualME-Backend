@@ -303,7 +303,7 @@ app.get('/auth/google/start', (req, res) => {
     });
   res.redirect(url);
 });
-// GET /people/:id/calendar/next?limit=3&calendarId=primary
+// GET /people/:id/calendar/window?limit=3&calendarId=primary
 app.get('/people/:id/calendar/window', async (req, res) => {
   try {
     if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
@@ -357,7 +357,7 @@ app.get('/people/:id/calendar/window', async (req, res) => {
 
 
 // ============================================================
-// Calendar: GET /calendar/next
+// Calendar: GET /calendar/window
 // Requires: user session (Authorization: Bearer <your JWT>)
 // Stores refreshToken in Users (already handled in /auth/callback)
 // ============================================================
@@ -393,6 +393,7 @@ app.get('/calendar/window', async (req, res) => {
     });
 
     const items = (data.items || []).map(simplifyEvent);
+    console.log(items);
     return res.json({ range: { startIso, endIso, labelDates, timeZone }, items });
   } catch (e) {
     console.error('[CALENDAR WINDOW ERROR]', e);
