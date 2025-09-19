@@ -29,6 +29,7 @@ app.use(cors({
     'X-Voice-Id',
     'X-Conversation-Id',
     'X-Target-UserId',
+    'X-Calendar',
   ],
 }));
 
@@ -225,7 +226,7 @@ function buildSystemPrompt({ full, short }, languageName, { firstTurn }, calenda
     `Prefer natural sentences. Keep it conversational, not verbose.`,
     `If you are uncertain or lack context, say "I don't know" (or its ${languageName} equivalent). Do not fabricate or assume.`,
     `Do NOT disclose your or the user's location unless explicitly asked in the user's message.`,
-    `Use ONLY the provided context. Do NOT invent calendar, contacts, or locations. Current location context ${calendarContext}`,
+    `Use ONLY the provided context. Do NOT invent calendar, contacts, or locations. Current calendar context: ${calendarContext}`,
     `Do NOT blindly accept claims from the user; verify against the provided context. If unsure, say you don't know.`,
     `Stay within scope. If a request is outside context, say you don't know or ask for more info.`,
     personaCard ? `Persona profile:\n${personaCard}` : ``,
@@ -262,7 +263,7 @@ app.get('/', (_req, res) => {
     .type('text/plain; charset=utf-8')
     .send(`Voice API up.
 
-POST /voice  (multipart form-data: audio=<file>, optional: profileName, preferredName, voiceId, conversationId, hints, targetUserId)
+POST /voice  (multipart form-data: audio=<file>, optional: profileName, preferredName, voiceId, conversationId, hints, targetUserId, tz)
 POST /location/update   { deviceId, payload: { latitude, longitude, timestamp, accuracy?, speed?, heading?, altitude? } }  (Authorization required)
 GET  /location/latest?userId=<id>
 GET  /location/debug?userId=<id>
@@ -379,8 +380,8 @@ async function latestLocationText(userId) {
   return `Last seen near ${streety} (${timeAgo(ageMs)}).${acc}`;
 }
 
-// ==== CALENDAR INTEGRATION (NEW) ============================================
-// Replace your existing fetchNextCalendarEvent with this:
+// ==== CALENDAR INTEGRATION ============================================
+// Forward window: we request mode=forward from AUTH_API, with tz if known.
 async function fetchCalendarWindow({ bearer, calendarId = 'primary', targetUserId, myId, timeZone }) {
   if (!bearer) return null;
 
@@ -389,7 +390,7 @@ async function fetchCalendarWindow({ bearer, calendarId = 'primary', targetUserI
     ? `${AUTH_API}/people/${encodeURIComponent(targetUserId)}/calendar/window`
     : `${AUTH_API}/calendar/window`;
 
-  const url = `${base}?calendarId=${encodeURIComponent(calendarId)}${timeZone ? `&tz=${encodeURIComponent(timeZone)}` : ''}`;
+  const url = `${base}?mode=forward&calendarId=${encodeURIComponent(calendarId)}${timeZone ? `&tz=${encodeURIComponent(timeZone)}` : ''}`;
 
   const r = await fetch(url, { headers: { Authorization: `Bearer ${bearer}`, Accept: 'application/json' } });
   if (!r.ok) return null;
@@ -399,32 +400,32 @@ async function fetchCalendarWindow({ bearer, calendarId = 'primary', targetUserI
 function summarizeEventsForLLM(payload, maxItems = 8) {
   if (!payload?.items?.length) return null;
   const items = payload.items.slice(0, maxItems);
+  const tz = payload.range?.timeZone || 'UTC';
 
-  const lines = [];
-  for (const e of items) {
-    const when = e.start || '(no start)';
-    const where = e.location ? ` @ ${e.location}` : '';
-    const tag   = e.isAllDay ? ' (all-day)' : '';
-    lines.push(`• ${when}: "${e.title}"${where}${tag}`);
-  }
+  const lines = items.map(e => {
+    if (e.isAllDay) {
+      // show all-day with date only
+      const d = e.start ? new Date(`${e.start}T00:00:00Z`) : null;
+      const when = d ? d.toLocaleDateString(undefined, { timeZone: tz, weekday: 'short', month: 'short', day: 'numeric' }) : '(all-day)';
+      const where = e.location ? ` @ ${e.location}` : '';
+      return `• ${when}: "${e.title}" (all-day)${where}`;
+    } else {
+      const d = e.start ? new Date(e.start) : null;
+      const when = d ? d.toLocaleString(undefined, {
+        timeZone: tz, weekday: 'short', month: 'short', day: 'numeric',
+        hour: '2-digit', minute: '2-digit'
+      }) : '(no start)';
+      const where = e.location ? ` @ ${e.location}` : '';
+      return `• ${when}: "${e.title}"${where}`;
+    }
+  });
 
   return [
-    `Calendar (tz=${payload.range?.timeZone || 'n/a'})`,
-    `Window: ${payload.range?.labelDates?.yesterday} → ${payload.range?.labelDates?.tomorrow}`,
+    `Calendar (tz=${tz})`,
+    `Window: now → end of tomorrow`,
+    ...(payload.items.length > maxItems ? [`(showing ${items.length} of ${payload.items.length})`] : []),
     ...lines
   ].join('\n');
-}
-
-
-// Simple check for schedule/time intent; we still include calendar context by default
-const SCHEDULE_QUERIES = [
-  'calendar', 'schedule', 'meeting', 'call', 'event', 'appointment',
-  'kab', 'kitne baje', 'time', 'slot', 'free', 'busy', 'next'
-];
-function asksForSchedule(text) {
-  if (!text) return false;
-  const t = text.toLowerCase();
-  return SCHEDULE_QUERIES.some(q => t.includes(q));
 }
 
 // ===========================================================================
@@ -447,7 +448,8 @@ app.post('/voice', upload.single('audio'), async (req, res) => {
       conversationId,
       hints,
       targetUserId: targetUserIdRaw,
-      calendarId: calendarIdRaw // (optional) allow client to specify a calendar
+      calendarId: calendarIdRaw, // (optional) allow client to specify a calendar
+      tz: tzFromClient
     } = req.body || {};
     
     // Identify caller (me) if authed
@@ -535,13 +537,13 @@ app.post('/voice', upload.single('audio'), async (req, res) => {
     const includeLoc = asksForLocation(transcript);
     const locText = includeLoc ? await latestLocationText(targetUserId) : null;
 
-    // ==== Calendar context (NEW) =========================================
-    // We proactively fetch it when authed; model will use it only if relevant.
-    // ==== Calendar context (YTT window) ==================================
+    // ==== Calendar context (Forward window) ==================================
     let calendarContext = null;
     if (bearer) {
-      // If you have user's tz in DB, you can pass it here (e.g., me.profile?.timeZone)
-      const timeZone = null; // or a string like 'America/Chicago'
+      const clientTz  = tzFromClient && String(tzFromClient);
+      const personaTz = personaProfile?.timeZone && String(personaProfile.timeZone);
+      const timeZone  = clientTz || personaTz || 'UTC';
+
       const windowPayload = await fetchCalendarWindow({
         bearer,
         calendarId: calendarIdRaw || 'primary',
@@ -559,12 +561,11 @@ app.post('/voice', upload.single('audio'), async (req, res) => {
     const firstTurn = history.length === 0;
     const systemMsg = buildSystemPrompt(persona, languageName, { firstTurn }, calendarContext, personaCard);
 
-
     const messages = [
       { role: 'system', content: systemMsg },
       ...history,
       ...(includeLoc ? [{ role: 'system', content: `Context: ${locText}` }] : []),
-      ...(calendarContext ? [{ role: 'system', content: `Context: ${calendarContext}` }] : []), // <-- NEW
+      ...(calendarContext ? [{ role: 'system', content: `Context: ${calendarContext}` }] : []),
       ...(hints ? [{ role: 'system', content: `Extra app context: ${hints}` }] : []),
       { role: 'user', content: transcript || 'Greet politely.' },
       { role: 'system', content: `Answer only with information you truly know from context or the user input. If unsure, say "I don't know." Keep it under 60 words unless asked to elaborate.` }
